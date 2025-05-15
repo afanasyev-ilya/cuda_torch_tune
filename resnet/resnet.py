@@ -7,6 +7,8 @@ from PIL import Image
 import requests
 from io import BytesIO
 import torchvision.transforms as transforms
+from torchvision.models import ResNet50_Weights
+
 
 #####################################################################################################
 
@@ -31,12 +33,19 @@ custom_batchnorm_ext = ext.load(
 
 
 # Load fused BN-ReLU extension
-#fused_bn_relu_ext = ext.load(
-#    name="fused_bn_relu_ext",  # Different name
-#    sources=["fused_bn_relu.cpp", "fused_bn_relu_kernel.cu"],
-#    extra_cuda_cflags=["-O3", "--use_fast_math"],
-#    verbose=True
-#)
+fused_bn_relu_ext = ext.load(
+    name="fused_bn_relu_ext",  # Different name
+    sources=["fused_bn_relu.cpp", "fused_bn_relu_kernel.cu"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+    verbose=True
+)
+
+class CustomReLU(Module):
+    def __init__(self):
+        super().__init__()
+        
+    def forward(self, input):
+        return custom_relu_ext.custom_relu_forward(input)
 
 class CustomBatchNorm2d(Module):
     def __init__(self, bn_layer):
@@ -57,12 +66,24 @@ class CustomBatchNorm2d(Module):
             self.eps
         )
 
-class CustomReLU(Module):
-    def __init__(self):
+class FusedBNReLU(Module):
+    def __init__(self, bn_layer):
         super().__init__()
+        self.register_buffer('weight', bn_layer.weight.clone())
+        self.register_buffer('bias', bn_layer.bias.clone())
+        self.register_buffer('running_mean', bn_layer.running_mean.clone())
+        self.register_buffer('running_var', bn_layer.running_var.clone())
+        self.eps = bn_layer.eps
         
-    def forward(self, input):
-        return custom_relu_ext.custom_relu_forward(input)
+    def forward(self, x):
+        return CUDA_EXT.fused_bn_relu_forward(
+            x,
+            self.weight,
+            self.bias,
+            self.running_mean,
+            self.running_var,
+            self.eps
+        )
 
 def replace_batchnorm(model):
     for name, module in model.named_children():
@@ -77,6 +98,24 @@ def replace_relu(module):
             setattr(module, name, CustomReLU())
         else:
             replace_relu(child)
+
+def fuse_bn_relu(model):
+    for name, module in model.named_children():
+        if isinstance(module, torch.nn.Sequential):
+            new_children = []
+            skip_next = False
+            for i, child in enumerate(module.children()):
+                if skip_next:
+                    skip_next = False
+                    continue
+                if isinstance(child, torch.nn.BatchNorm2d) and i+1 < len(module) and isinstance(module[i+1], torch.nn.ReLU):
+                    new_children.append(FusedBNReLU(child))
+                    skip_next = True
+                else:
+                    new_children.append(child)
+            setattr(model, name, torch.nn.Sequential(*new_children))
+        else:
+            fuse_bn_relu(module)
 
 #####################################################################################################
 
@@ -108,22 +147,28 @@ def load_image():
 
 #####################################################################################################
 
-def infer(batch_size = 32, custom_ops_list = []):
+def infer(batch_size = 32, custom_ops_list = [], max_benchmark_iters = 20):
+
+    print("\n Using custom ops: ", custom_ops_list)
     input = load_image()
 
     # Load original ResNet-50
-    model = models.resnet50(pretrained=True).cuda().eval()
+    model = models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V1).cuda().eval()
 
     if len(custom_ops_list) > 0:
         print("replacing torch ops with custom kernels!")
 
-        if "relu" in custom_ops_list:
-            replace_relu(model)
-            print("replaced RELU!")
+        if "fused_bn_relu" in custom_ops_list:
+            print("fused bn and relu")
+            fuse_bn_relu(model)
+        else:
+            if "relu" in custom_ops_list:
+                replace_relu(model)
+                print("replaced RELU!")
 
-        if "bn" in custom_ops_list:
-            replace_batchnorm(model)
-            print("replaced Batchnorm!")
+            if "bn" in custom_ops_list:
+                replace_batchnorm(model)
+                print("replaced Batchnorm!")
 
     # Warmup and verify
     with torch.no_grad():
@@ -134,21 +179,41 @@ def infer(batch_size = 32, custom_ops_list = []):
     probabilities = torch.nn.functional.softmax(output[0], dim=0)
     top5_prob, top5_ids = torch.topk(probabilities, 5)
 
-    print("\nTop predictions:")
+    print("Top predictions:")
     for i in range(top5_prob.size(0)):
         print(f"{labels[top5_ids[i]]:>20s}: {top5_prob[i].item()*100:.2f}%")
 
     input = torch.randn(batch_size, 3, 224, 224).cuda()
 
     # Benchmark
-    torch.cuda.synchronize()
-    start = time.time()
-    with torch.no_grad():
-        output = model(input)
-    torch.cuda.synchronize()
-    print("Using custom ops: ", custom_ops_list)
-    print(f"Inference time: {(time.time() - start) * 1000:.2f}ms")
+    avg_time = 0.0
+    min_time = 0.0
+    max_time = 0.0
+    for iter in range(0, max_benchmark_iters):
+        torch.cuda.synchronize()
+        start = time.time()
+        with torch.no_grad():
+            output = model(input)
+        torch.cuda.synchronize()
+        cur_time = (time.time() - start) * 1000
+        avg_time += cur_time / max_benchmark_iters
+        if min_time == 0:
+            min_time = cur_time
+        else:
+            min_time = min(cur_time, min_time)
+        if max_time == 0:
+            max_time = cur_time
+        else:
+            max_time = max(cur_time, max_time)
+
+    print(f"Inference min time: {min_time:.2f} ms")
+    print(f"Inference avg time: {avg_time:.2f} ms")
+    print(f"Inference max time: {max_time:.2f} ms")
+    print("\n\n")
 
 
-infer(batch_size = 32, custom_ops_list = ["relu", "bn"])
-infer(batch_size = 32, custom_ops_list = [])
+bs = 256
+
+infer(batch_size = bs, custom_ops_list = ["relu", "bn"])
+infer(batch_size = bs, custom_ops_list = ["fused_bn_relu"])
+infer(batch_size = bs, custom_ops_list = [])
