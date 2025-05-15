@@ -147,7 +147,7 @@ def load_image():
 
 #####################################################################################################
 
-def infer(batch_size = 32, custom_ops_list = [], max_benchmark_iters = 20):
+def infer(batch_size = 32, custom_ops_list = [], benchmark_iters = 10):
 
     print("\n Using custom ops: ", custom_ops_list)
     input = load_image()
@@ -189,14 +189,14 @@ def infer(batch_size = 32, custom_ops_list = [], max_benchmark_iters = 20):
     avg_time = 0.0
     min_time = 0.0
     max_time = 0.0
-    for iter in range(0, max_benchmark_iters):
+    for iter in range(0, benchmark_iters):
         torch.cuda.synchronize()
         start = time.time()
         with torch.no_grad():
             output = model(input)
         torch.cuda.synchronize()
         cur_time = (time.time() - start) * 1000
-        avg_time += cur_time / max_benchmark_iters
+        avg_time += cur_time / benchmark_iters
         if min_time == 0:
             min_time = cur_time
         else:
@@ -206,14 +206,16 @@ def infer(batch_size = 32, custom_ops_list = [], max_benchmark_iters = 20):
         else:
             max_time = max(cur_time, max_time)
 
-    print(f"Inference min time: {min_time:.2f} ms")
+    #print(f"Inference min time: {min_time:.2f} ms")
     print(f"Inference avg time: {avg_time:.2f} ms")
-    print(f"Inference max time: {max_time:.2f} ms")
+    #print(f"Inference max time: {max_time:.2f} ms")
     print("\n\n")
 
 
 bs = 256
+iters = 10
 
-infer(batch_size = bs, custom_ops_list = ["relu", "bn"])
-infer(batch_size = bs, custom_ops_list = ["fused_bn_relu"])
-infer(batch_size = bs, custom_ops_list = [])
+infer(batch_size=bs, custom_ops_list=[], benchmark_iters=iters)
+infer(batch_size=bs, custom_ops_list=["fused_bn_relu"], benchmark_iters=iters)
+infer(batch_size=bs, custom_ops_list=["relu", "bn"], benchmark_iters=iters)
+
