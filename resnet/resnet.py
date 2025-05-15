@@ -148,12 +148,23 @@ def load_image():
 #####################################################################################################
 
 def infer(batch_size = 32, custom_ops_list = [], benchmark_iters = 10):
-
     print("\n Using custom ops: ", custom_ops_list)
     input = load_image()
 
     # Load original ResNet-50
     model = models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V1).cuda().eval()
+
+    # 3. Manually set to eval mode without fusion
+    model = model.eval()
+
+    verify_no_fusion = False
+    if verify_no_fusion:
+        # 4. Verify no Conv-BatchNorm fusion
+        for name, module in model.named_modules():
+            if isinstance(module, torch.nn.Conv2d):
+                print(f"Conv layer {name} remains separate")
+            if isinstance(module, torch.nn.BatchNorm2d):
+                print(f"BatchNorm layer {name} remains separate")
 
     if len(custom_ops_list) > 0:
         print("replacing torch ops with custom kernels!")
