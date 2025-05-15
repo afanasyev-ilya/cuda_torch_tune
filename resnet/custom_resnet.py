@@ -9,6 +9,21 @@ from io import BytesIO
 import torchvision.transforms as transforms
 
 
+# Custom CUDA extension module
+import torch.utils.cpp_extension
+CUDA_EXT = torch.utils.cpp_extension.load(
+    name="custom_relu",
+    sources=["custom_relu.cpp", "custom_relu_kernel.cu"],
+    extra_cuda_cflags=["-O3"]
+)
+
+class CustomReLU(Module):
+    def __init__(self):
+        super().__init__()
+        
+    def forward(self, input):
+        return CUDA_EXT.custom_relu_forward(input)
+
 def load_labels():
     # Load ImageNet class labels
     LABELS_URL = 'https://raw.githubusercontent.com/anishathalye/imagenet-simple-labels/master/imagenet-simple-labels.json'
@@ -36,11 +51,23 @@ def load_image():
     return input_tensor.unsqueeze(0).cuda()  # Add batch dimension
 
 
-def infer():
+def infer(add_custom_ops = False):
     input = load_image()
 
     # Load original ResNet-50
     model = models.resnet50(pretrained=True).cuda().eval()
+
+    if add_custom_ops:
+        print("replacing torch ops with custom kernels!")
+        def replace_relu(module):
+            for name, child in module.named_children():
+                if isinstance(child, torch.nn.ReLU):
+                    setattr(module, name, CustomReLU())
+                else:
+                    replace_relu(child)
+
+        replace_relu(model)
+        print("replaced RELU!")
 
     # Warmup
     with torch.no_grad():
@@ -52,6 +79,7 @@ def infer():
     with torch.no_grad():
         output = model(input)
     torch.cuda.synchronize()
+    print("Using custom ops: ", add_custom_ops)
     print(f"Inference time: {(time.time() - start) * 1000:.2f}ms")
 
     # Get predictions
@@ -64,4 +92,5 @@ def infer():
         print(f"{labels[top5_ids[i]]:>20s}: {top5_prob[i].item()*100:.2f}%")
 
 
-infer()
+infer(False)
+infer(True)
