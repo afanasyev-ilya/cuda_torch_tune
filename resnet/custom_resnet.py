@@ -51,36 +51,29 @@ def load_image():
     return input_tensor.unsqueeze(0).cuda()  # Add batch dimension
 
 
-def infer(add_custom_ops = False):
+def infer(batch_size = 32, custom_ops_list = []):
     input = load_image()
 
     # Load original ResNet-50
     model = models.resnet50(pretrained=True).cuda().eval()
 
-    if add_custom_ops:
+    if len(custom_ops_list) > 0:
         print("replacing torch ops with custom kernels!")
-        def replace_relu(module):
-            for name, child in module.named_children():
-                if isinstance(child, torch.nn.ReLU):
-                    setattr(module, name, CustomReLU())
-                else:
-                    replace_relu(child)
 
-        replace_relu(model)
-        print("replaced RELU!")
+        if "relu" in custom_ops_list:
+            def replace_relu(module):
+                for name, child in module.named_children():
+                    if isinstance(child, torch.nn.ReLU):
+                        setattr(module, name, CustomReLU())
+                    else:
+                        replace_relu(child)
 
-    # Warmup
-    with torch.no_grad():
-        _ = model(input)
+            replace_relu(model)
+            print("replaced RELU!")
 
-    # Benchmark
-    torch.cuda.synchronize()
-    start = time.time()
+    # Warmup and verify
     with torch.no_grad():
         output = model(input)
-    torch.cuda.synchronize()
-    print("Using custom ops: ", add_custom_ops)
-    print(f"Inference time: {(time.time() - start) * 1000:.2f}ms")
 
     # Get predictions
     labels = load_labels()
@@ -91,6 +84,17 @@ def infer(add_custom_ops = False):
     for i in range(top5_prob.size(0)):
         print(f"{labels[top5_ids[i]]:>20s}: {top5_prob[i].item()*100:.2f}%")
 
+    input = torch.randn(batch_size, 3, 224, 224).cuda()
 
-infer(False)
-infer(True)
+    # Benchmark
+    torch.cuda.synchronize()
+    start = time.time()
+    with torch.no_grad():
+        output = model(input)
+    torch.cuda.synchronize()
+    print("Using custom ops: ", custom_ops_list)
+    print(f"Inference time: {(time.time() - start) * 1000:.2f}ms")
+
+
+infer(batch_size = 32, custom_ops_list = ["relu"])
+infer(batch_size = 32, custom_ops_list = [])
