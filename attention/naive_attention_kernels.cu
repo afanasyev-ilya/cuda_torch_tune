@@ -23,6 +23,9 @@ __global__ void custom_transpose_forward_kernel(const scalar_t* __restrict__ inp
 }
 
 torch::Tensor custom_transpose_forward(torch::Tensor input) {
+    TORCH_CHECK(input.is_cuda(), "inputs must be on cuda");
+    TORCH_CHECK(input.dtype() == torch::kFloat32, "inputs must be fp32");
+
     const int64_t batch_size = input.size(0);
     const int64_t seq_size = input.size(1);
     const int64_t embed_size = input.size(2);
@@ -34,17 +37,13 @@ torch::Tensor custom_transpose_forward(torch::Tensor input) {
                    (embed_size - 1) / block_size.y + 1,
                    batch_size);
 
-    if (input.scalar_type() == torch::kFloat32) {
-        custom_transpose_forward_kernel<float><<<grid_size, block_size>>>(
-            input.data_ptr<float>(),
-            output.data_ptr<float>(),
-            batch_size,
-            seq_size,
-            embed_size
-        );
-    } else {
-        std::cout << "unsupported element type in custom transpose, should be float 32" << std::endl;
-    }
+    custom_transpose_forward_kernel<float><<<grid_size, block_size>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        seq_size,
+        embed_size
+    );
     
     return output;
 }
@@ -84,6 +83,11 @@ __global__ void custom_matmul_forward_kernel(const scalar_t* __restrict__ A,
 
 
 torch::Tensor custom_matmul_forward(torch::Tensor a, torch::Tensor b) {
+    TORCH_CHECK(a.is_cuda(), "inputs must be on cuda");
+    TORCH_CHECK(a.dtype() == torch::kFloat32, "inputs must be fp32");
+    TORCH_CHECK(b.is_cuda(), "inputs must be on cuda");
+    TORCH_CHECK(b.dtype() == torch::kFloat32, "inputs must be fp32");
+
     const int64_t batch_size = a.size(0);
     const int64_t m_size = a.size(1);
     const int64_t k_size = a.size(2);
@@ -96,19 +100,15 @@ torch::Tensor custom_matmul_forward(torch::Tensor a, torch::Tensor b) {
                    (n_size - 1) / block_size.y + 1,
                    batch_size);
 
-    if (a.scalar_type() == torch::kFloat32 && b.scalar_type() == torch::kFloat32) {
-        custom_matmul_forward_kernel<float><<<grid_size, block_size>>>(
-            a.data_ptr<float>(),
-            b.data_ptr<float>(),
-            c.data_ptr<float>(),
-            batch_size,
-            m_size,
-            n_size,
-            k_size
-        );
-    } else {
-        std::cout << "unsupported element type in custom matmul, should be float 32" << std::endl;
-    }
+    custom_matmul_forward_kernel<float><<<grid_size, block_size>>>(
+        a.data_ptr<float>(),
+        b.data_ptr<float>(),
+        c.data_ptr<float>(),
+        batch_size,
+        m_size,
+        n_size,
+        k_size
+    );
     
     return c;
 }
@@ -146,26 +146,26 @@ __global__ void custom_softmax_forward_kernel(const scalar_t* __restrict__ input
 
 
 torch::Tensor custom_softmax_forward(torch::Tensor input) {
+    TORCH_CHECK(input.is_cuda(), "inputs must be on cuda");
+    TORCH_CHECK(input.dtype() == torch::kFloat32, "inputs must be fp32");
+
     const int64_t batch_size = input.size(0);
     const int64_t h_size = input.size(1);
     const int64_t s_size = input.size(2);
 
-    torch::Tensor output = torch::empty_like(input);
+    auto opts = input.options();
+    torch::Tensor output = torch::empty({batch_size, h_size, s_size}, opts);
 
     dim3 block_size(1, 1);
     dim3 grid_size(batch_size, h_size);
 
-    if (input.scalar_type() == torch::kFloat32) {
-        custom_softmax_forward_kernel<float><<<grid_size, block_size>>>(
-            input.data_ptr<float>(),
-            output.data_ptr<float>(),
-            batch_size,
-            h_size,
-            s_size
-        );
-    } else {
-        std::cout << "unsupported element type in custom softmax, should be float 32" << std::endl;
-    }
+    custom_softmax_forward_kernel<float><<<grid_size, block_size>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        h_size,
+        s_size
+    );
     
     return output;
 }
@@ -184,23 +184,23 @@ __global__ void custom_eltwise_div_kernel(const scalar_t* __restrict__ input,
 
 
 torch::Tensor custom_eltwise_div_forward(torch::Tensor input, float val) {
+    TORCH_CHECK(input.is_cuda(), "inputs must be on cuda");
+    TORCH_CHECK(input.dtype() == torch::kFloat32, "inputs must be fp32");
+
     const int64_t num_elements = input.numel();
 
-    torch::Tensor output = torch::empty_like(input);
+    auto opts = input.options();
+    torch::Tensor output = torch::empty({input.size(0), input.size(1), input.size(2)}, opts);
 
     dim3 block_size(1024);
     dim3 grid_size((num_elements - 1)/block_size.x + 1);
 
-    if (input.scalar_type() == torch::kFloat32) {
-        custom_eltwise_div_kernel<float><<<grid_size, block_size>>>(
-            input.data_ptr<float>(),
-            output.data_ptr<float>(),
-            val,
-            num_elements
-        );
-    } else {
-        std::cout << "unsupported element type in custom softmax, should be float 32" << std::endl;
-    }
+    custom_eltwise_div_kernel<float><<<grid_size, block_size>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        val,
+        num_elements
+    );
     
     return output;
 }
