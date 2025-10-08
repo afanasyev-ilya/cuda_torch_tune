@@ -93,7 +93,8 @@ torch::Tensor custom_matmul_forward(torch::Tensor a, torch::Tensor b) {
     const int64_t k_size = a.size(2);
     const int64_t n_size = b.size(2);
 
-    torch::Tensor c = torch::empty({batch_size, m_size, n_size}, torch::kFloat32).cuda();
+    auto opts = a.options();
+    torch::Tensor c = torch::empty({batch_size, m_size, n_size}, opts);
 
     dim3 block_size(32, 32, 1);
     dim3 grid_size((m_size - 1) / block_size.x + 1, 
