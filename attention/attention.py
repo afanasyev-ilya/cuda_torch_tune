@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import time
 from torch.nn import Module
+from ext import extensions
 
 
 DEBUG_MODE = False
@@ -17,17 +18,6 @@ else:
     embed_dim = 4096
     num_heads = 1
 
-
-# Custom CUDA extension module
-import torch.utils.cpp_extension as ext
-
-# Load custom transpose extension
-naive_attention_ext = ext.load(
-    name="naive_attention_ext",  # Must be unique
-    sources=["naive_attention.cpp", "naive_attention_kernels.cu"],
-    extra_cuda_cflags=["-O3"],
-    verbose=True
-)
 
 def benchmark(name, model, *inputs):
     warmup_iters = 5
@@ -126,10 +116,10 @@ def cuda_naive_attention(Q, K, V):
 
         # since we write the model on our own, can jsut create such functions instead of search and replace
         def cuda_transpose(self, input):
-            return naive_attention_ext.custom_transpose_forward(input)
+            return extensions().custom_transpose_forward(input)
         
         def cuda_mamtul(self, a, b):
-            return naive_attention_ext.custom_matmul_forward(a, b)
+            return extensions().custom_matmul_forward(a, b)
 
         def forward(self, query, key, value):
             # 1. Calculate dot product of query and key^T
@@ -153,21 +143,6 @@ def cuda_naive_attention(Q, K, V):
     attn_output, attn_output_weights = benchmark("cuda naive", mha, Q, K, V)
 
     return attn_output
-
-
-def test_matmul():
-    class CustomMatmul(Module):
-        def __init__(self):
-            super().__init__()
-            
-        def forward(self, a, b):
-            return naive_attention_ext.custom_matmul_forward(a, b)
-
-    a = torch.randn(2, 4, 5).cuda()
-    b = torch.randn(2, 5, 6).cuda()
-
-    mm = CustomMatmul().cuda().eval()
-    print("MATMUL test result: ", torch.allclose(mm(a, b), torch.matmul(a, b)))
 
 
 if __name__ == "__main__":
