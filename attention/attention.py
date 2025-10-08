@@ -121,6 +121,9 @@ def cuda_naive_attention(Q, K, V):
         def cuda_mamtul(self, a, b):
             return extensions().custom_matmul_forward(a, b)
 
+        def cuda_softmax(self, input):
+            return extensions().custom_softmax_forward(input)
+
         def forward(self, query, key, value):
             # 1. Calculate dot product of query and key^T
             scores = self.cuda_mamtul(query, self.cuda_transpose(key))
@@ -131,7 +134,7 @@ def cuda_naive_attention(Q, K, V):
             scores = scores / sqrt_dk
 
             # 3. Apply softmax to get attention weights
-            attention_weights = torch.nn.functional.softmax(scores, dim=-1)
+            attention_weights = self.cuda_softmax(scores)
 
             # 4. Multiply by K
             attention_output = self.cuda_mamtul(attention_weights, value);

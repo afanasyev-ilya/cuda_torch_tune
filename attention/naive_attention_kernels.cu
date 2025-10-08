@@ -112,3 +112,60 @@ torch::Tensor custom_matmul_forward(torch::Tensor a, torch::Tensor b) {
     
     return c;
 }
+
+
+template <typename scalar_t>
+__global__ void custom_softmax_forward_kernel(const scalar_t* __restrict__ input,
+                                              scalar_t* __restrict__ output,
+                                              size_t b_size,
+                                              size_t h_size,
+                                              size_t s_size) {
+    
+    int b_idx = blockIdx.x;
+    int h_idx = blockIdx.y;
+
+    if(b_idx < b_size && h_idx < h_size) {
+        scalar_t max_val = 0.0;
+        int row_offset = s_size * (b_idx * h_size + h_idx);
+        for(int i = 0; i < s_size; i++) {
+            max_val = input[row_offset + i] > max_val ? input[row_offset + i] : max_val;
+        }
+        
+        scalar_t sum = 0.0;
+        for(int i = 0; i < s_size; i++) {
+            scalar_t e = __expf(input[row_offset + i] - max_val);
+            output[row_offset + i] = e;
+            sum += e;
+        }
+
+        for(int i = 0; i < s_size; i++) {
+            output[row_offset + i] /= sum;
+        }
+    }
+}
+
+
+torch::Tensor custom_softmax_forward(torch::Tensor input) {
+    const int64_t batch_size = input.size(0);
+    const int64_t h_size = input.size(1);
+    const int64_t s_size = input.size(2);
+
+    torch::Tensor output = torch::empty_like(input);
+
+    dim3 block_size(1, 1);
+    dim3 grid_size(batch_size, h_size);
+
+    if (input.scalar_type() == torch::kFloat32) {
+        custom_softmax_forward_kernel<float><<<grid_size, block_size>>>(
+            input.data_ptr<float>(),
+            output.data_ptr<float>(),
+            batch_size,
+            h_size,
+            s_size
+        );
+    } else {
+        std::cout << "unsupported element type in custom softmax, should be float 32" << std::endl;
+    }
+    
+    return output;
+}
