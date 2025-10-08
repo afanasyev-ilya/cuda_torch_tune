@@ -50,3 +50,14 @@ torch::Tensor custom_transpose_forward(torch::Tensor input) {
     
     return output;
 }
+
+
+torch::Tensor custom_matmul_forward(torch::Tensor a, torch::Tensor b) {
+    const int64_t batch_size = a.size(0);
+    const int64_t seq_size = a.size(1);
+    const int64_t embed_size = a.size(2);
+
+    torch::Tensor c = torch::empty({batch_size, seq_size, seq_size}, torch::kFloat32).cuda();
+    
+    return c;
+}
