@@ -136,8 +136,11 @@ def cuda_naive_attention(Q, K, V):
             dk_sqrt = math.sqrt(self.embed_dim)
             scores = self.cuda_eltwise_div(scores, dk_sqrt)
 
+            # 3. compute attention weights
+            attention_weights = self.cuda_softmax(scores)
+
             # 4. Multiply by K
-            attention_output = self.cuda_mamtul(self.cuda_softmax(scores), value);
+            attention_output = self.cuda_mamtul(attention_weights, value);
 
             return attention_output
     
