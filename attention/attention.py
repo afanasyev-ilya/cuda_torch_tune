@@ -4,7 +4,7 @@ import time
 from torch.nn import Module
 
 
-DEBUG_MODE = True
+DEBUG_MODE = False
 
 if DEBUG_MODE:
     batch_size = 1
@@ -127,10 +127,13 @@ def cuda_naive_attention(Q, K, V):
         # since we write the model on our own, can jsut create such functions instead of search and replace
         def cuda_transpose(self, input):
             return naive_attention_ext.custom_transpose_forward(input)
+        
+        def cuda_mamtul(self, a, b):
+            return naive_attention_ext.custom_matmul_forward(a, b)
 
         def forward(self, query, key, value):
             # 1. Calculate dot product of query and key^T
-            scores = torch.matmul(query, self.cuda_transpose(key))
+            scores = self.cuda_mamtul(query, self.cuda_transpose(key))
 
             # 2. Scaling scores by embed_size sqrt (scalar)
             dk = torch.tensor(self.embed_dim, dtype=torch.float32).cuda()
@@ -141,7 +144,7 @@ def cuda_naive_attention(Q, K, V):
             attention_weights = torch.nn.functional.softmax(scores, dim=-1)
 
             # 4. Multiply by K
-            attention_output = torch.matmul(attention_weights, value);
+            attention_output = self.cuda_mamtul(attention_weights, value);
 
             return attention_output, attention_weights
     
@@ -151,6 +154,20 @@ def cuda_naive_attention(Q, K, V):
 
     return attn_output
 
+
+def test_matmul():
+    class CustomMatmul(Module):
+        def __init__(self):
+            super().__init__()
+            
+        def forward(self, a, b):
+            return naive_attention_ext.custom_matmul_forward(a, b)
+
+    a = torch.randn(2, 4, 5).cuda()
+    b = torch.randn(2, 5, 6).cuda()
+
+    mm = CustomMatmul().cuda().eval()
+    print("MATMUL test result: ", torch.allclose(mm(a, b), torch.matmul(a, b)))
 
 
 if __name__ == "__main__":
@@ -173,12 +190,3 @@ if __name__ == "__main__":
         print(cuda_naive_res)
 
 
-    class CustomMatmul(Module):
-        def __init__(self):
-            super().__init__()
-            
-        def forward(self, a, b):
-            return naive_attention_ext.custom_matmul_forward(a, naive_attention_ext.custom_transpose_forward(b))
-
-    mm = CustomMatmul().cuda().eval()
-    print(mm(Q, K))
