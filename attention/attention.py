@@ -3,6 +3,7 @@ import torch.nn as nn
 import time
 from torch.nn import Module
 from ext import extensions
+import math
 
 
 DEBUG_MODE = False
@@ -124,14 +125,16 @@ def cuda_naive_attention(Q, K, V):
         def cuda_softmax(self, input):
             return extensions().custom_softmax_forward(input)
 
+        def cuda_eltwise_div(self, input, val):
+            return extensions().custom_eltwise_div_forward(input, val)
+
         def forward(self, query, key, value):
             # 1. Calculate dot product of query and key^T
             scores = self.cuda_mamtul(query, self.cuda_transpose(key))
 
             # 2. Scaling scores by embed_size sqrt (scalar)
-            dk = torch.tensor(self.embed_dim, dtype=torch.float32).cuda()
-            sqrt_dk = torch.sqrt(dk)
-            scores = scores / sqrt_dk
+            dk_sqrt = math.sqrt(self.embed_dim)
+            scores = self.cuda_eltwise_div(scores, dk_sqrt)
 
             # 3. Apply softmax to get attention weights
             attention_weights = self.cuda_softmax(scores)
@@ -148,7 +151,7 @@ def cuda_naive_attention(Q, K, V):
     return attn_output
 
 
-if __name__ == "__main__":
+def verify():
     Q = torch.randn(batch_size, seq_len, embed_dim).cuda()
     K = torch.randn(batch_size, seq_len, embed_dim).cuda()
     V = torch.randn(batch_size, seq_len, embed_dim).cuda()
@@ -168,3 +171,13 @@ if __name__ == "__main__":
         print(cuda_naive_res)
 
 
+def run():
+    Q = torch.randn(batch_size, seq_len, embed_dim).cuda()
+    K = torch.randn(batch_size, seq_len, embed_dim).cuda()
+    V = torch.randn(batch_size, seq_len, embed_dim).cuda()
+
+    cuda_naive_res = cuda_naive_attention(Q, K, V)
+
+
+if __name__ == "__main__":
+    run()

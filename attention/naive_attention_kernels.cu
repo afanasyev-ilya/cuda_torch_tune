@@ -130,7 +130,7 @@ __global__ void custom_softmax_forward_kernel(const scalar_t* __restrict__ input
         for(int i = 0; i < s_size; i++) {
             max_val = input[row_offset + i] > max_val ? input[row_offset + i] : max_val;
         }
-        
+
         scalar_t sum = 0.0;
         for(int i = 0; i < s_size; i++) {
             scalar_t e = __expf(input[row_offset + i] - max_val);
@@ -162,6 +162,41 @@ torch::Tensor custom_softmax_forward(torch::Tensor input) {
             batch_size,
             h_size,
             s_size
+        );
+    } else {
+        std::cout << "unsupported element type in custom softmax, should be float 32" << std::endl;
+    }
+    
+    return output;
+}
+
+
+template <typename scalar_t>
+__global__ void custom_eltwise_div_kernel(const scalar_t* __restrict__ input,
+                                          scalar_t* __restrict__ output,
+                                          scalar_t val,
+                                          size_t num_elem) {
+    const int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < num_elem) {
+        output[idx] = input[idx] / val;
+    }
+}
+
+
+torch::Tensor custom_eltwise_div_forward(torch::Tensor input, float val) {
+    const int64_t num_elements = input.numel();
+
+    torch::Tensor output = torch::empty_like(input);
+
+    dim3 block_size(1024);
+    dim3 grid_size((num_elements - 1)/block_size.x + 1);
+
+    if (input.scalar_type() == torch::kFloat32) {
+        custom_eltwise_div_kernel<float><<<grid_size, block_size>>>(
+            input.data_ptr<float>(),
+            output.data_ptr<float>(),
+            val,
+            num_elements
         );
     } else {
         std::cout << "unsupported element type in custom softmax, should be float 32" << std::endl;

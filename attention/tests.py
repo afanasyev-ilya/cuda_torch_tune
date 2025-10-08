@@ -52,10 +52,26 @@ def test_softmax_matches_pytorch(B, M, N):
     input = torch.randn(2, 4, 5).cuda()
 
     custom_softmax = CustomSoftmax().cuda().eval()
-    print(custom_softmax(input))
-    print(torch.softmax(input, dim=-1))
     assert(torch.allclose(custom_softmax(input), torch.softmax(input, dim=-1)))
 
 
+@pytest.mark.parametrize("B,M,N,Val", [(1, 5, 5, 5.0)])
+def test_eltwise_matches_pytorch(B, M, N, Val):
+    class CustomEltwise(Module):
+        def __init__(self):
+            super().__init__()
+            
+        def forward(self, input, val):
+            return extensions().custom_eltwise_div_forward(input, val)
+
+    input = torch.randn(2, 4, 5).cuda()
+
+    elt = CustomEltwise().cuda().eval()
+    out = elt(input, Val)
+    ref = input / torch.tensor(Val, dtype=torch.float32)
+
+    assert(torch.allclose(out, ref))
+
+
 # write code to see prints here
-# test_softmax_matches_pytorch(1, 5, 5)
+#test_eltwise_matches_pytorch(1, 5, 5, 5.0)
