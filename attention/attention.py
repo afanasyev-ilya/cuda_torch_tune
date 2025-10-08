@@ -83,10 +83,6 @@ def torch_attention(Q, K, V):
     # Perform the forward pass
     attn_output, attn_output_weights = benchmark("torch mha", mha, Q, K, V)
 
-    # Print the shapes of the outputs
-    print(f"Shape of attention output: {attn_output.shape}")
-    print(f"Shape of attention weights: {attn_output_weights.shape}")
-
     return attn_output
 
 
@@ -120,47 +116,39 @@ def layerwise_torch_attention(Q, K, V):
 
     attn_output, attn_output_weights = benchmark("layerwise attention", mha, Q, K, V)
 
-    print(f"Shape of attention output: {attn_output.shape}")
-    print(f"Shape of attention weights: {attn_output_weights.shape}")
-
     return attn_output
 
 
-def cuda_torch_attention(Q, K, V):
-    class LayerwiseSDPA(nn.Module):
+def cuda_naive_attention(Q, K, V):
+    class CudaNaiveSDPA(nn.Module):
         def __init__(self, embed_dim):
             super().__init__()
             self.embed_dim = embed_dim
 
+        # since we write the model on our own, can jsut create such functions instead of search and replace
         def cuda_transpose(self, input):
             return custom_transpose_ext.custom_transpose_forward(input)
 
         def forward(self, query, key, value):
-            # 1. Calculate dot product of query and key
-            # (batch_size, query_seq_len, embed_dim) @ (batch_size, embed_dim, key_seq_len)
-            # -> (batch_size, query_seq_len, key_seq_len)
+            # 1. Calculate dot product of query and key^T
             scores = torch.matmul(query, self.cuda_transpose(key))
 
-            # 2. scaling
+            # 2. Scaling scores by embed_size sqrt (scalar)
             dk = torch.tensor(self.embed_dim, dtype=torch.float32).cuda()
             sqrt_dk = torch.sqrt(dk)
-
             scores = scores / sqrt_dk
 
             # 3. Apply softmax to get attention weights
             attention_weights = torch.nn.functional.softmax(scores, dim=-1)
 
-            # 4. *= K
+            # 4. Multiply by K
             attention_output = torch.matmul(attention_weights, value);
 
             return attention_output, attention_weights
     
-    mha = LayerwiseSDPA(embed_dim).cuda().eval()
+    mha = CudaNaiveSDPA(embed_dim).cuda().eval()
 
-    attn_output, attn_output_weights = benchmark("layerwise attention", mha, Q, K, V)
-
-    print(f"Shape of attention output: {attn_output.shape}")
-    print(f"Shape of attention weights: {attn_output_weights.shape}")
+    attn_output, attn_output_weights = benchmark("cuda naive", mha, Q, K, V)
 
     return attn_output
 
@@ -175,12 +163,12 @@ if __name__ == "__main__":
 
     torch_res = torch_attention(Q, K, V)
     custom_res = layerwise_torch_attention(Q, K, V)
-    cuda_res = cuda_torch_attention(Q, K, V)
+    cuda_naive_res = cuda_naive_attention(Q, K, V)
 
     print(f"layerwise test all close? {torch.allclose(torch_res, custom_res)}")
-    print(f"cuda torch naive all close? {torch.allclose(torch_res, cuda_res)}")
+    print(f"cuda naive all close? {torch.allclose(torch_res, cuda_naive_res)}")
 
     if DEBUG_MODE:
         print(torch_res)
         print(custom_res)
-        print(cuda_res)
+        print(cuda_naive_res)
