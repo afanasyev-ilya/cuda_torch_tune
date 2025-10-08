@@ -1,11 +1,13 @@
 import torch
 import torch.nn as nn
 import time
+from torch.nn import Module
 
-DEBUG_MODE = False
+
+DEBUG_MODE = True
 
 if DEBUG_MODE:
-    batch_size = 1
+    batch_size = 2
     seq_len = 3
     embed_dim = 5
     num_heads = 1
@@ -14,6 +16,18 @@ else:
     seq_len = 100
     embed_dim = 4096
     num_heads = 1
+
+
+# Custom CUDA extension module
+import torch.utils.cpp_extension as ext
+
+# Load custom ReLU extension
+custom_transpose_ext = ext.load(
+    name="custom_transpose_ext",  # Must be unique
+    sources=["custom_transpose.cpp", "custom_transpose_kernel.cu"],
+    extra_cuda_cflags=["-O3"],
+    verbose=True
+)
 
 
 def benchmark(name, model, *inputs):
@@ -112,6 +126,46 @@ def layerwise_torch_attention(Q, K, V):
     return attn_output
 
 
+def cuda_torch_attention(Q, K, V):
+    class LayerwiseSDPA(nn.Module):
+        def __init__(self, embed_dim):
+            super().__init__()
+            self.embed_dim = embed_dim
+
+        def cuda_transpose(self, input):
+            return custom_transpose_ext.custom_transpose_forward(input)
+
+        def forward(self, query, key, value):
+            # 1. Calculate dot product of query and key
+            # (batch_size, query_seq_len, embed_dim) @ (batch_size, embed_dim, key_seq_len)
+            # -> (batch_size, query_seq_len, key_seq_len)
+            scores = torch.matmul(query, self.cuda_transpose(key))
+
+            # 2. scaling
+            dk = torch.tensor(self.embed_dim, dtype=torch.float32).cuda()
+            sqrt_dk = torch.sqrt(dk)
+
+            scores = scores / sqrt_dk
+
+            # 3. Apply softmax to get attention weights
+            attention_weights = torch.nn.functional.softmax(scores, dim=-1)
+
+            # 4. *= K
+            attention_output = torch.matmul(attention_weights, value);
+
+            return attention_output, attention_weights
+    
+    mha = LayerwiseSDPA(embed_dim).cuda().eval()
+
+    attn_output, attn_output_weights = benchmark("layerwise attention", mha, Q, K, V)
+
+    print(f"Shape of attention output: {attn_output.shape}")
+    print(f"Shape of attention weights: {attn_output_weights.shape}")
+
+    return attn_output
+
+
+
 if __name__ == "__main__":
     Q = torch.randn(batch_size, seq_len, embed_dim).cuda()
     K = torch.randn(batch_size, seq_len, embed_dim).cuda()
@@ -121,10 +175,12 @@ if __name__ == "__main__":
 
     torch_res = torch_attention(Q, K, V)
     custom_res = layerwise_torch_attention(Q, K, V)
+    cuda_res = cuda_torch_attention(Q, K, V)
 
-    are_all_close = torch.allclose(torch_res, custom_res)
-    print(f"Are all elements close (default tolerances)? {are_all_close}")
+    print(f"layerwise test all close? {torch.allclose(torch_res, custom_res)}")
+    print(f"cuda torch naive all close? {torch.allclose(torch_res, cuda_res)}")
 
     if DEBUG_MODE:
         print(torch_res)
         print(custom_res)
+        print(cuda_res)
