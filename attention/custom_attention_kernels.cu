@@ -2,6 +2,9 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <iostream>
+#include <cublas_v2.h>
+#include <ATen/cuda/CUDAContext.h>
+
 
 template <typename scalar_t>
 __global__ void custom_transpose_forward_kernel(const scalar_t* __restrict__ input,
@@ -114,7 +117,6 @@ torch::Tensor custom_matmul_forward(torch::Tensor a, torch::Tensor b) {
     return c;
 }
 
-
 template <typename scalar_t>
 __global__ void custom_softmax_forward_kernel(const scalar_t* __restrict__ input,
                                               scalar_t* __restrict__ output,
@@ -204,4 +206,49 @@ torch::Tensor custom_eltwise_div_forward(torch::Tensor input, float val) {
     );
     
     return output;
+}
+
+// ------------------------------------ op -------------------------------------------------------
+
+torch::Tensor qkt_cublas_forward(torch::Tensor Q, torch::Tensor K, float scale) {
+    TORCH_CHECK(Q.is_cuda() && K.is_cuda(), "CUDA tensors required");
+    TORCH_CHECK(Q.dtype()==torch::kFloat32 && K.dtype()==torch::kFloat32, "fp32 only here");
+
+    const int64_t B = Q.size(0), S = Q.size(1), D = Q.size(2);
+
+    const int m = S, n = S, k = D;
+    const int lda = k;
+    const int ldb = k;
+    const int ldc = n;
+    const long long strideA = static_cast<long long>(S) * static_cast<long long>(D);
+    const long long strideB = static_cast<long long>(S) * static_cast<long long>(D);
+    const long long strideC = static_cast<long long>(S) * static_cast<long long>(S);
+
+    auto opts = Q.options();
+    torch::Tensor scores = torch::empty({B, S, S}, opts);
+
+    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+    auto stream = at::cuda::getCurrentCUDAStream();
+    cublasSetStream(handle, stream);
+
+    const float alpha = scale;
+    const float beta  = 0.f;
+
+    // Enable Tensor Cores for fp32 via TF32 (Ampere+):
+    cublasComputeType_t compute = CUBLAS_COMPUTE_32F_FAST_TF32;
+    cudaDataType_t T = CUDA_R_32F;
+
+    cublasGemmStridedBatchedEx(
+        handle,
+        CUBLAS_OP_T, CUBLAS_OP_N, // we do a small trick here. transpose Q instead of T (since row-col major), and K is already transposed
+        n, m, k,                      // (S, S, D)
+        &alpha,
+        K.data_ptr<float>(), T, lda, strideB,
+        Q.data_ptr<float>(), T, lda, strideA,
+        &beta,
+        scores.data_ptr<float>(), T, ldc, strideC,
+        static_cast<int>(B),
+        compute,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    return scores;
 }

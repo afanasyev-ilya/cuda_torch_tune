@@ -6,12 +6,12 @@ from ext import extensions
 import math
 
 
-DEBUG_MODE = False
+DEBUG_MODE = True
 
 if DEBUG_MODE:
     batch_size = 1
-    seq_len = 3
-    embed_dim = 5
+    seq_len = 5
+    embed_dim = 4
     num_heads = 1
 else:
     batch_size = 128
@@ -144,9 +144,47 @@ def cuda_naive_attention(Q, K, V):
 
             return attention_output
     
-    mha = CudaNaiveSDPA(embed_dim).cuda().eval()
+    sdpa = CudaNaiveSDPA(embed_dim).cuda().eval()
 
-    attn_output = benchmark("cuda naive", mha, Q, K, V)
+    attn_output = benchmark("cuda naive", sdpa, Q, K, V)
+
+    return attn_output
+
+
+
+def cuda_opt_layerwise_attention(Q, K, V):
+    class CudaOptLayerwiseSDPA(nn.Module):
+        def __init__(self, embed_dim):
+            super().__init__()
+            self.embed_dim = embed_dim
+
+        def cuda_mamtul(self, a, b):
+            return extensions().custom_matmul_forward(a, b)
+
+        def cuda_softmax(self, input):
+            return extensions().custom_softmax_forward(input)
+
+        def cuda_eltwise_div(self, input, val):
+            return extensions().custom_eltwise_div_forward(input, val)
+
+        def cublas_qkt(self, query_input, key_input, scale_input):
+            return extensions().qkt_cublas_forward(query_input, key_input, scale_input)
+
+        def forward(self, query, key, value):
+            # 1. use cublas to transpose and multiply
+            scores = self.cublas_qkt(query, key, math.sqrt(self.embed_dim))
+
+            # 2. compute attention weights
+            attention_weights = self.cuda_softmax(scores)
+
+            # 3. Multiply by K
+            attention_output = self.cuda_mamtul(attention_weights, value);
+
+            return attention_output
+    
+    sdpa = CudaOptLayerwiseSDPA(embed_dim).cuda().eval()
+
+    attn_output = benchmark("cuda opt layerwise", sdpa, Q, K, V)
 
     return attn_output
 
@@ -161,14 +199,21 @@ def verify():
     torch_res = torch_attention(Q, K, V)
     custom_res = layerwise_torch_attention(Q, K, V)
     cuda_naive_res = cuda_naive_attention(Q, K, V)
+    cuda_opt_layerwise_res = cuda_opt_layerwise_attention(Q, K, V)
 
     print(f"layerwise test all close? {torch.allclose(torch_res, custom_res)}")
     print(f"cuda naive all close? {torch.allclose(torch_res, cuda_naive_res)}")
+    print(f"cuda opt layerwise all close? {torch.allclose(torch_res, cuda_opt_layerwise_res)}")
 
     if DEBUG_MODE:
+        print("build-in torch (ref): ------------ ")
         print(torch_res)
+        print("custom torch (ref): ------------ ")
         print(custom_res)
+        print("CUDA naive: ------------ ")
         print(cuda_naive_res)
+        print("CUDA opt: ------------ ")
+        print(cuda_opt_layerwise_res)
 
 
 def run():
@@ -180,4 +225,4 @@ def run():
 
 
 if __name__ == "__main__":
-    run()
+    verify()
