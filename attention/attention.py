@@ -174,7 +174,7 @@ def cuda_opt_layerwise_attention(Q, K, V):
             # 2. compute attention weights
             self.cuda_softmax(scores)
 
-            # 3. Multiply by K
+            # 3. Multiply by V
             attention_output = self.cublas_pv(scores, value);
 
             return attention_output
