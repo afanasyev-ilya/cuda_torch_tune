@@ -5,6 +5,7 @@
 #include <cublas_v2.h>
 #include <ATen/cuda/CUDAContext.h>
 
+//#define TIME_FLOPS
 
 template <typename scalar_t>
 __global__ void custom_transpose_forward_kernel(const scalar_t* __restrict__ input,
@@ -211,7 +212,7 @@ torch::Tensor custom_eltwise_div_forward(torch::Tensor input, float val) {
     return output;
 }
 
-// ------------------------------------ op -------------------------------------------------------
+// ------------------------------------ optimize --------------------------------------------------
 
 torch::Tensor qkt_cublas_forward(torch::Tensor Q, torch::Tensor K, float scale) {
     TORCH_CHECK(Q.is_cuda() && K.is_cuda(), "CUDA tensors required");
@@ -241,6 +242,13 @@ torch::Tensor qkt_cublas_forward(torch::Tensor Q, torch::Tensor K, float scale) 
     cublasComputeType_t compute = CUBLAS_COMPUTE_32F_FAST_TF32;
     cudaDataType_t T = CUDA_R_32F;
 
+    #ifdef TIME_FLOPS
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start, 0);
+    #endif
+
     cublasGemmStridedBatchedEx(
         handle,
         CUBLAS_OP_T, CUBLAS_OP_N, // we do a small trick here. transpose Q instead of T (since row-col major), and K is already transposed
@@ -253,6 +261,20 @@ torch::Tensor qkt_cublas_forward(torch::Tensor Q, torch::Tensor K, float scale) 
         static_cast<int>(B),
         compute,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+    #ifdef TIME_FLOPS
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+    float elapsed_time_ms;
+    cudaEventElapsedTime(&elapsed_time_ms, start, stop);
+    double sec_per_call = elapsed_time_ms/1e3;
+    double flops_per_call = 2.0 * static_cast<double>(B) * static_cast<double>(S) * static_cast<double>(S) * static_cast<double>(D);
+    std::cout << "qkt sizes: [" << S << "x" << D << "] * [" << D << "x" << S << "]" << std::endl;
+    std::cout << "qkt TFLOP/s: " << flops_per_call / (sec_per_call*1e12) << std::endl;
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    #endif
+
     return scores;
 }
 
@@ -301,6 +323,13 @@ torch::Tensor pv_cublas_forward(torch::Tensor Probs, torch::Tensor V) {
     cublasComputeType_t compute = CUBLAS_COMPUTE_32F_FAST_TF32;
     const cudaDataType T = CUDA_R_32F;
 
+    #ifdef TIME_FLOPS
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start, 0);
+    #endif
+
     cublasGemmStridedBatchedEx(
         handle,
         CUBLAS_OP_N, CUBLAS_OP_T,           // A=V (N), B=Probs (T)
@@ -313,6 +342,19 @@ torch::Tensor pv_cublas_forward(torch::Tensor Probs, torch::Tensor V) {
         static_cast<int>(B),
         compute,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+    #ifdef TIME_FLOPS
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+    float elapsed_time_ms;
+    cudaEventElapsedTime(&elapsed_time_ms, start, stop);
+    double sec_per_call = elapsed_time_ms/1e3;
+    double flops_per_call = 2.0 * static_cast<double>(B) * static_cast<double>(D) * static_cast<double>(S) * static_cast<double>(S);
+    std::cout << "   pv sizes: [" << D << "x" << S << "] * [" << S << "x" << S << "]" << std::endl;
+    std::cout << "   pv TFLOP/s: " << flops_per_call / (sec_per_call*1e12) << std::endl;
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    #endif
 
     return Out;
 }
