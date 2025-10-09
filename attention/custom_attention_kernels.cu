@@ -5,7 +5,7 @@
 #include <cublas_v2.h>
 #include <ATen/cuda/CUDAContext.h>
 
-//#define TIME_FLOPS
+#define TIME_FLOPS
 
 template <typename scalar_t>
 __global__ void custom_transpose_forward_kernel(const scalar_t* __restrict__ input,
@@ -107,13 +107,14 @@ torch::Tensor custom_matmul_forward(torch::Tensor a, torch::Tensor b) {
                    batch_size);
 
     #ifdef TIME_FLOPS
+    auto stream = at::cuda::getCurrentCUDAStream();
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
-    cudaEventRecord(start, 0);
+    cudaEventRecord(start, stream.stream());
     #endif
 
-    custom_matmul_forward_kernel<float><<<grid_size, block_size>>>(
+    custom_matmul_forward_kernel<float><<<grid_size, block_size, 0, stream.stream()>>>(
         a.data_ptr<float>(),
         b.data_ptr<float>(),
         c.data_ptr<float>(),
@@ -124,7 +125,7 @@ torch::Tensor custom_matmul_forward(torch::Tensor a, torch::Tensor b) {
     );
 
     #ifdef TIME_FLOPS
-    cudaEventRecord(stop, 0);
+    cudaEventRecord(stop, stream.stream());
     cudaEventSynchronize(stop);
     float elapsed_time_ms;
     cudaEventElapsedTime(&elapsed_time_ms, start, stop);
