@@ -6,7 +6,7 @@ from ext import extensions
 import math
 
 
-DEBUG_MODE = True
+DEBUG_MODE = False
 
 if DEBUG_MODE:
     batch_size = 1
@@ -172,7 +172,7 @@ def cuda_opt_layerwise_attention(Q, K, V):
 
         def forward(self, query, key, value):
             # 1. use cublas to transpose and multiply
-            scores = self.cublas_qkt(query, key, math.sqrt(self.embed_dim))
+            scores = self.cublas_qkt(query, key, 1.0/math.sqrt(self.embed_dim))
 
             # 2. compute attention weights
             attention_weights = self.cuda_softmax(scores)
@@ -189,7 +189,15 @@ def cuda_opt_layerwise_attention(Q, K, V):
     return attn_output
 
 
-def verify():
+def check(name, outs, ref):
+    all_close = torch.allclose(outs, ref)
+    print(f"{name} test all close? {all_close}")
+    if not all_close:
+        max_diff = torch.max(torch.abs(outs - ref))
+        print(f"{name} maximum difference between the tensors is: {max_diff}")
+
+
+def run_all():
     Q = torch.randn(batch_size, seq_len, embed_dim).cuda()
     K = torch.randn(batch_size, seq_len, embed_dim).cuda()
     V = torch.randn(batch_size, seq_len, embed_dim).cuda()
@@ -201,9 +209,9 @@ def verify():
     cuda_naive_res = cuda_naive_attention(Q, K, V)
     cuda_opt_layerwise_res = cuda_opt_layerwise_attention(Q, K, V)
 
-    print(f"layerwise test all close? {torch.allclose(torch_res, custom_res)}")
-    print(f"cuda naive all close? {torch.allclose(torch_res, cuda_naive_res)}")
-    print(f"cuda opt layerwise all close? {torch.allclose(torch_res, cuda_opt_layerwise_res)}")
+    check("custom torch", torch_res, custom_res)
+    check("cuda naive", torch_res, cuda_naive_res)
+    check("cuda layerwise opt", torch_res, cuda_opt_layerwise_res)
 
     if DEBUG_MODE:
         print("build-in torch (ref): ------------ ")
@@ -225,4 +233,4 @@ def run():
 
 
 if __name__ == "__main__":
-    verify()
+    run_all()
