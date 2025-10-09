@@ -316,3 +316,111 @@ torch::Tensor pv_cublas_forward(torch::Tensor Probs, torch::Tensor V) {
 
     return Out;
 }
+
+
+#define FULL_MASK 0xffffffff
+
+__device__ __forceinline__ float warp_reduce_max(float val) {
+    // Iterate over log2(warpSize) steps
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val = fmaxf(val, __shfl_down_sync(FULL_MASK, val, offset));
+    }
+    return val; // The maximum value will be in thread 0 of the warp
+}
+
+__device__ float warp_reduce_sum(float val) {
+    // Perform a tree reduction using __shfl_down_sync
+    // Threads exchange values with threads at a decreasing offset
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val += __shfl_down_sync(FULL_MASK, val, offset);
+    }
+    return val;
+}
+
+template <typename scalar_t>
+__global__ void opt_softmax_forward_kernel(const scalar_t* __restrict__ input,
+                                           scalar_t* __restrict__ output,
+                                           size_t b_size,
+                                           size_t h_size,
+                                           size_t s_size) {
+    
+    int b_idx = blockIdx.x;
+    int h_idx = blockIdx.y;
+    int tid = threadIdx.x;
+    int block_size = blockDim.x;
+    int lane = tid % 32;
+    int warp_id = tid / 32;
+    __shared__ scalar_t reduce_ws[32]; // 1024 / 32 = 32
+
+    reduce_ws[lane] = std::numeric_limits<scalar_t>::lowest();
+    __syncthreads();
+
+    if(b_idx < b_size && h_idx < h_size) {
+        scalar_t max_val = std::numeric_limits<scalar_t>::lowest();
+        int row_offset = s_size * (b_idx * h_size + h_idx);
+        for(int i = tid; i < s_size; i += block_size) {
+            max_val = input[row_offset + i] > max_val ? input[row_offset + i] : max_val;
+        }
+        scalar_t max_in_warp = warp_reduce_max(max_val);
+        if(lane == 0) { // each warp writes its max
+            reduce_ws[warp_id] = max_in_warp;
+        }
+        __syncthreads();
+
+        // to obtain global max inside each warp
+        max_val = warp_reduce_max(reduce_ws[lane]);
+
+        // broadcast global max to all threads inside warp
+        max_val = __shfl_sync(FULL_MASK, max_val, 0);
+
+        __syncthreads(); // since will use same workspace
+        reduce_ws[lane] = 0;
+        __syncthreads();
+
+        scalar_t sum = 0.0;
+        for(int i = tid; i < s_size; i += block_size) {
+            scalar_t e = __expf(input[row_offset + i] - max_val);
+            output[row_offset + i] = e;
+            sum += e;
+        }
+        scalar_t sum_in_warp = warp_reduce_sum(sum);
+        if(lane == 0) {
+            reduce_ws[warp_id] = sum_in_warp;
+        }
+        __syncthreads();
+
+        sum = warp_reduce_sum(reduce_ws[lane]);
+
+        sum = __shfl_sync(FULL_MASK, sum, 0);
+
+        for(int i = tid; i < s_size; i += block_size) {
+            output[row_offset + i] /= sum;
+        }
+    }
+}
+
+
+torch::Tensor opt_softmax_forward(torch::Tensor input) {
+    TORCH_CHECK(input.is_cuda(), "inputs must be on cuda");
+    TORCH_CHECK(input.dtype() == torch::kFloat32, "inputs must be fp32");
+
+    const int64_t batch_size = input.size(0);
+    const int64_t h_size = input.size(1);
+    const int64_t s_size = input.size(2);
+
+    auto opts = input.options();
+    torch::Tensor output = torch::empty({batch_size, h_size, s_size}, opts);
+
+    dim3 block_size(std::min(512, static_cast<int>(s_size)), 1);
+    dim3 grid_size(batch_size, h_size);
+
+    opt_softmax_forward_kernel<float><<<grid_size, block_size>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        h_size,
+        s_size
+    );
+    
+    return output;
+}

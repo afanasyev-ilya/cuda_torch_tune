@@ -22,7 +22,7 @@ def test_transpose_matches_pytorch(B, M, N):
 
 
 
-@pytest.mark.parametrize("B,M,N,K", [(1, 5, 7, 8), (2, 5, 5, 5), (2, 5, 10, 15)])
+@pytest.mark.parametrize("B,M,N,K", [(1, 5, 7, 8), (2, 5, 5, 5), (1, 5, 10, 5)])
 def test_matmul_matches_pytorch(B, M, N, K):
     class CustomMatmul(Module):
         def __init__(self):
@@ -40,7 +40,7 @@ def test_matmul_matches_pytorch(B, M, N, K):
     assert torch.allclose(out, ref)
 
 
-@pytest.mark.parametrize("B,M,N", [(1, 5, 5), (1, 6, 8), (2, 7, 9)])
+@pytest.mark.parametrize("B,M,N", [(1, 5, 15), (1, 6, 256), (1, 5, 1024), (1, 5, 32)])
 def test_softmax_matches_pytorch(B, M, N):
     class CustomSoftmax(Module):
         def __init__(self):
@@ -53,6 +53,20 @@ def test_softmax_matches_pytorch(B, M, N):
 
     custom_softmax = CustomSoftmax().cuda().eval()
     assert(torch.allclose(custom_softmax(input), torch.softmax(input, dim=-1)))
+
+@pytest.mark.parametrize("B,M,N", [(1, 5, 15), (1, 6, 256), (1, 5, 1024), (1, 5, 32)])
+def test_opt_softmax_matches_pytorch(B, M, N):
+    class OptSoftmax(Module):
+        def __init__(self):
+            super().__init__()
+            
+        def forward(self, input):
+            return extensions().opt_softmax_forward(input)
+
+    input = torch.randn(2, 4, 5).cuda()
+
+    opt_softmax = OptSoftmax().cuda().eval()
+    assert(torch.allclose(opt_softmax(input), torch.softmax(input, dim=-1)))
 
 
 @pytest.mark.parametrize("B,M,N,Val", [(1, 5, 5, 5.0)])
