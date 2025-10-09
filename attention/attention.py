@@ -170,6 +170,9 @@ def cuda_opt_layerwise_attention(Q, K, V):
         def cublas_qkt(self, query_input, key_input, scale_input):
             return extensions().qkt_cublas_forward(query_input, key_input, scale_input)
 
+        def cublas_pv(self, weights, value):
+            return extensions().pv_cublas_forward(weights, value)
+
         def forward(self, query, key, value):
             # 1. use cublas to transpose and multiply
             scores = self.cublas_qkt(query, key, 1.0/math.sqrt(self.embed_dim))
@@ -178,7 +181,7 @@ def cuda_opt_layerwise_attention(Q, K, V):
             attention_weights = self.cuda_softmax(scores)
 
             # 3. Multiply by K
-            attention_output = self.cuda_mamtul(attention_weights, value);
+            attention_output = self.cublas_pv(attention_weights, value);
 
             return attention_output
     
@@ -229,7 +232,7 @@ def run():
     K = torch.randn(batch_size, seq_len, embed_dim).cuda()
     V = torch.randn(batch_size, seq_len, embed_dim).cuda()
 
-    cuda_naive_res = cuda_naive_attention(Q, K, V)
+    cuda_naive_res = cuda_opt_layerwise_attention(Q, K, V)
 
 
 if __name__ == "__main__":

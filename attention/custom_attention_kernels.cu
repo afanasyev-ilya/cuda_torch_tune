@@ -33,7 +33,8 @@ torch::Tensor custom_transpose_forward(torch::Tensor input) {
     const int64_t seq_size = input.size(1);
     const int64_t embed_size = input.size(2);
 
-    torch::Tensor output = torch::empty({batch_size, embed_size, seq_size}, torch::kFloat32).cuda();
+    auto opts = input.options();
+    torch::Tensor output = torch::empty({batch_size, embed_size, seq_size}, opts);
 
     dim3 block_size(32, 32, 1);
     dim3 grid_size((seq_size - 1) / block_size.x + 1, 
@@ -251,4 +252,65 @@ torch::Tensor qkt_cublas_forward(torch::Tensor Q, torch::Tensor K, float scale) 
         compute,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     return scores;
+}
+
+torch::Tensor pv_cublas_forward(torch::Tensor Probs, torch::Tensor V) {
+    TORCH_CHECK(Probs.is_cuda() && V.is_cuda(), "inputs must be CUDA");
+    TORCH_CHECK(Probs.dtype() == torch::kFloat32 && V.dtype() == torch::kFloat32, "fp32 only (v0)");
+    TORCH_CHECK(Probs.dim() == 3 && V.dim() == 3, "Probs,V must be [B,S,S] and [B,S,D]");
+    TORCH_CHECK(Probs.is_contiguous() && V.is_contiguous(), "inputs must be contiguous");
+    TORCH_CHECK(Probs.size(0) == V.size(0) && Probs.size(1) == V.size(1),
+                "batch and S must match: Probs=[B,S,S], V=[B,S,D]");
+
+    const int64_t B = Probs.size(0);
+    const int64_t S = Probs.size(1);
+    const int64_t D = V.size(2);
+
+    // Output: [B, S, D] (row-major)
+    auto opts = V.options();
+    torch::Tensor Out = torch::empty({B, S, D}, opts);
+
+    // Make sure we execute on the right device/stream
+    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+    auto stream = at::cuda::getCurrentCUDAStream();
+    cublasSetStream(handle, stream);
+
+    // Row-major trick:
+    // Compute C_col(D×S) = A_col(D×S) * B_col(S×S) with:
+    //   A = V,  opA = N  -> A_col = V_row^T (D×S)
+    //   B = P,  opB = T  -> B_col = (Probs_row^T)^T? (we need P_row^T), opB=T gives P_row^T (S×S)
+    // Result C_col(D×S) maps to Out_row(S×D) in memory.
+    const int m = static_cast<int>(D);  // rows of C_col
+    const int n = static_cast<int>(S);  // cols of C_col
+    const int k = static_cast<int>(S);
+
+    const int lda = static_cast<int>(D);  // rows of A_col (V_row^T)
+    const int ldb = static_cast<int>(S);  // rows of B_col (P_col)
+    const int ldc = static_cast<int>(D);  // rows of C_col
+
+    const long long strideA = static_cast<long long>(S) * static_cast<long long>(D); // V
+    const long long strideB = static_cast<long long>(S) * static_cast<long long>(S); // Probs
+    const long long strideC = static_cast<long long>(S) * static_cast<long long>(D); // Out
+
+    const float alpha = 1.f;
+    const float beta  = 0.f;
+
+    // Fast TF32 (Ampere+) or switch to CUBLAS_COMPUTE_32F for strict fp32
+    cublasComputeType_t compute = CUBLAS_COMPUTE_32F_FAST_TF32;
+    const cudaDataType T = CUDA_R_32F;
+
+    cublasGemmStridedBatchedEx(
+        handle,
+        CUBLAS_OP_N, CUBLAS_OP_T,           // A=V (N), B=Probs (T)
+        m, n, k,                            // (D, S, S)
+        &alpha,
+        V.data_ptr<float>(),     T, lda, strideA,   // A
+        Probs.data_ptr<float>(), T, ldb, strideB,   // B
+        &beta,
+        Out.data_ptr<float>(),   T, ldc, strideC,   // C (row-major [S,D] as col-major [D,S])
+        static_cast<int>(B),
+        compute,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+    return Out;
 }
