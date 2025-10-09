@@ -98,8 +98,6 @@ torch::Tensor custom_matmul_forward(torch::Tensor a, torch::Tensor b) {
     const int64_t k_size = a.size(2);
     const int64_t n_size = b.size(2);
 
-    //std::cout << "[" << m_size << "x" << k_size << "] * [" << k_size << "x" << n_size << "]" << std::endl;
-
     auto opts = a.options();
     torch::Tensor c = torch::empty({batch_size, m_size, n_size}, opts);
 
@@ -107,6 +105,13 @@ torch::Tensor custom_matmul_forward(torch::Tensor a, torch::Tensor b) {
     dim3 grid_size((m_size - 1) / block_size.x + 1, 
                    (n_size - 1) / block_size.y + 1,
                    batch_size);
+
+    #ifdef TIME_FLOPS
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start, 0);
+    #endif
 
     custom_matmul_forward_kernel<float><<<grid_size, block_size>>>(
         a.data_ptr<float>(),
@@ -117,6 +122,19 @@ torch::Tensor custom_matmul_forward(torch::Tensor a, torch::Tensor b) {
         n_size,
         k_size
     );
+
+    #ifdef TIME_FLOPS
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+    float elapsed_time_ms;
+    cudaEventElapsedTime(&elapsed_time_ms, start, stop);
+    double sec_per_call = elapsed_time_ms/1e3;
+    double flops_per_call = 2.0 * static_cast<double>(batch_size) * static_cast<double>(m_size) * static_cast<double>(k_size) * static_cast<double>(n_size);
+    std::cout << "matmul sizes: [" << m_size << "x" << k_size << "] * [" << k_size << "x" << n_size << "]" << std::endl;
+    std::cout << "matmul TFLOP/s: " << flops_per_call / (sec_per_call*1e12) << std::endl;
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    #endif
     
     return c;
 }

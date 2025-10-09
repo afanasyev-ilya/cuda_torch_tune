@@ -21,7 +21,7 @@ else:
 
 
 def benchmark(name, model, *inputs):
-    warmup_iters = 5
+    warmup_iters = 2
     for iter in range(0, warmup_iters):
         torch.cuda.synchronize()
         with torch.no_grad():
@@ -30,7 +30,7 @@ def benchmark(name, model, *inputs):
     avg_time = 0.0
     min_time = 0.0
     max_time = 0.0
-    benchmark_iters = 10
+    benchmark_iters = 4
     for iter in range(0, benchmark_iters):
         torch.cuda.synchronize()
         start = time.time()
@@ -48,9 +48,9 @@ def benchmark(name, model, *inputs):
         else:
             max_time = max(cur_time, max_time)
 
-    print(f"Inference ({name}) min time: {min_time:.2f} ms")
+    #print(f"Inference ({name}) min time: {min_time:.2f} ms")
     print(f"Inference ({name}) avg time: {avg_time:.2f} ms")
-    print(f"Inference ({name}) max time: {max_time:.2f} ms")
+    #print(f"Inference ({name}) max time: {max_time:.2f} ms")
     print("\n\n")
     return outputs
 
@@ -158,14 +158,8 @@ def cuda_opt_layerwise_attention(Q, K, V):
             super().__init__()
             self.embed_dim = embed_dim
 
-        def cuda_mamtul(self, a, b):
-            return extensions().custom_matmul_forward(a, b)
-
         def cuda_softmax(self, input):
             return extensions().opt_softmax_forward(input)
-
-        def cuda_eltwise_div(self, input, val):
-            return extensions().custom_eltwise_div_forward(input, val)
 
         def cublas_qkt(self, query_input, key_input, scale_input):
             return extensions().qkt_cublas_forward(query_input, key_input, scale_input)
