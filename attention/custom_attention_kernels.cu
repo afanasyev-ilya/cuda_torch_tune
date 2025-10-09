@@ -342,8 +342,7 @@ __device__ float warp_reduce_sum(float val) {
 }
 
 template <typename scalar_t>
-__global__ void opt_softmax_forward_kernel(const scalar_t* __restrict__ input,
-                                           scalar_t* __restrict__ output,
+__global__ void opt_softmax_forward_kernel(scalar_t* __restrict__ data,
                                            size_t b_size,
                                            size_t h_size,
                                            size_t s_size) {
@@ -365,7 +364,7 @@ __global__ void opt_softmax_forward_kernel(const scalar_t* __restrict__ input,
         scalar_t max_val = std::numeric_limits<scalar_t>::lowest();
         int row_offset = s_size * (b_idx * h_size + h_idx);
         for(int i = tid; i < s_size; i += block_size) {
-            max_val = input[row_offset + i] > max_val ? input[row_offset + i] : max_val;
+            max_val = data[row_offset + i] > max_val ? data[row_offset + i] : max_val;
         }
         scalar_t max_in_warp = warp_reduce_max(max_val);
         if(lane == 0) { // each warp writes its max
@@ -381,8 +380,8 @@ __global__ void opt_softmax_forward_kernel(const scalar_t* __restrict__ input,
 
         scalar_t sum = 0.0;
         for(int i = tid; i < s_size; i += block_size) {
-            scalar_t e = __expf(input[row_offset + i] - max_val);
-            output[row_offset + i] = e;
+            scalar_t e = __expf(data[row_offset + i] - max_val);
+            data[row_offset + i] = e;
             sum += e;
         }
         scalar_t sum_in_warp = warp_reduce_sum(sum);
@@ -396,33 +395,27 @@ __global__ void opt_softmax_forward_kernel(const scalar_t* __restrict__ input,
         sum = __shfl_sync(FULL_MASK, sum, 0);
 
         for(int i = tid; i < s_size; i += block_size) {
-            output[row_offset + i] /= sum;
+            data[row_offset + i] /= sum;
         }
     }
 }
 
 
-torch::Tensor opt_softmax_forward(torch::Tensor input) {
-    TORCH_CHECK(input.is_cuda(), "inputs must be on cuda");
-    TORCH_CHECK(input.dtype() == torch::kFloat32, "inputs must be fp32");
+void opt_softmax_forward(torch::Tensor data) {
+    TORCH_CHECK(data.is_cuda(), "inputs must be on cuda");
+    TORCH_CHECK(data.dtype() == torch::kFloat32, "inputs must be fp32");
 
-    const int64_t batch_size = input.size(0);
-    const int64_t h_size = input.size(1);
-    const int64_t s_size = input.size(2);
-
-    auto opts = input.options();
-    torch::Tensor output = torch::empty({batch_size, h_size, s_size}, opts);
+    const int64_t batch_size = data.size(0);
+    const int64_t h_size = data.size(1);
+    const int64_t s_size = data.size(2);
 
     dim3 block_size(std::min(MAX_BLOCK_SIZE, static_cast<int>(s_size)), 1);
     dim3 grid_size(batch_size, h_size);
 
     opt_softmax_forward_kernel<float><<<grid_size, block_size>>>(
-        input.data_ptr<float>(),
-        output.data_ptr<float>(),
+        data.data_ptr<float>(),
         batch_size,
         h_size,
         s_size
     );
-    
-    return output;
 }

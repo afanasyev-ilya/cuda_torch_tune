@@ -61,12 +61,16 @@ def test_opt_softmax_matches_pytorch(B, M, N):
             super().__init__()
             
         def forward(self, input):
-            return extensions().opt_softmax_forward(input)
+            extensions().opt_softmax_forward(input)
+            return input
 
     input = torch.randn(2, 4, 5).cuda()
+    save_input = input
 
     opt_softmax = OptSoftmax().cuda().eval()
-    assert(torch.allclose(opt_softmax(input), torch.softmax(input, dim=-1)))
+    ref = torch.softmax(save_input, dim=-1)
+    out = opt_softmax(input)
+    assert(torch.allclose(out, ref))
 
 
 @pytest.mark.parametrize("B,M,N,Val", [(1, 5, 5, 5.0)])
