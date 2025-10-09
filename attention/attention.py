@@ -14,9 +14,9 @@ if DEBUG_MODE:
     embed_dim = 4
     num_heads = 1
 else:
-    batch_size = 128
-    seq_len = 100
-    embed_dim = 4096
+    batch_size = 4
+    seq_len = 4096 # as in llama2
+    embed_dim = 128 # as in llama2
     num_heads = 1
 
 
@@ -181,7 +181,7 @@ def cuda_opt_layerwise_attention(Q, K, V):
             attention_weights = self.cuda_softmax(scores)
 
             # 3. Multiply by K
-            attention_output = self.cublas_pv(attention_weights, value);
+            attention_output = self.cuda_mamtul(attention_weights, value);
 
             return attention_output
     

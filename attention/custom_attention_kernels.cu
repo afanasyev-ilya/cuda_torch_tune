@@ -97,6 +97,8 @@ torch::Tensor custom_matmul_forward(torch::Tensor a, torch::Tensor b) {
     const int64_t k_size = a.size(2);
     const int64_t n_size = b.size(2);
 
+    //std::cout << "[" << m_size << "x" << k_size << "] * [" << k_size << "x" << n_size << "]" << std::endl;
+
     auto opts = a.options();
     torch::Tensor c = torch::empty({batch_size, m_size, n_size}, opts);
 
