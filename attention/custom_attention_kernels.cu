@@ -131,8 +131,8 @@ torch::Tensor custom_matmul_forward(torch::Tensor a, torch::Tensor b) {
     cudaEventElapsedTime(&elapsed_time_ms, start, stop);
     double sec_per_call = elapsed_time_ms/1e3;
     double flops_per_call = 2.0 * static_cast<double>(batch_size) * static_cast<double>(m_size) * static_cast<double>(k_size) * static_cast<double>(n_size);
-    std::cout << "matmul sizes: [" << m_size << "x" << k_size << "] * [" << k_size << "x" << n_size << "]" << std::endl;
-    std::cout << "matmul TFLOP/s: " << flops_per_call / (sec_per_call*1e12) << std::endl;
+    std::cout << "NAIVE matmul sizes: [" << m_size << "x" << k_size << "] * [" << k_size << "x" << n_size << "]" << std::endl;
+    std::cout << "NAIVE matmul TFLOP/s: " << flops_per_call / (sec_per_call*1e12) << std::endl;
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
     #endif
@@ -479,4 +479,92 @@ void opt_softmax_forward(torch::Tensor data) {
         h_size,
         s_size
     );
+}
+
+////////////////////////////////////////////// fused matmul /////////////////////////////////
+
+template <typename scalar_t>
+__global__ void opt_matmul_forward_kernel(const scalar_t* __restrict__ A,
+                                             const scalar_t* __restrict__ B,
+                                             scalar_t* __restrict__ C,
+                                             size_t b_size,
+                                             size_t m_size,
+                                             size_t n_size, 
+                                             size_t k_size) {
+    
+    // Calculate global thread index within the batch dimension
+    int batch_idx = blockIdx.z;
+
+    // Calculate global thread index within the output matrix C for the current batch
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Check if the thread is within the bounds of the output matrix C
+    if (row < m_size && col < n_size && batch_idx < b_size) {
+        float sum = 0.0f;
+        // Calculate the starting offset for the current batch's matrices
+        int A_offset = batch_idx * m_size * k_size;
+        int B_offset = batch_idx * k_size * n_size;
+        int C_offset = batch_idx * m_size * n_size;
+
+        // Perform the dot product for the current element C[row][col]
+        for (int k = 0; k < k_size; ++k) {
+            sum += A[A_offset + row * k_size + k] * B[B_offset + k * n_size + col];
+        }
+        C[C_offset + row * n_size + col] = sum;
+    }
+}
+
+
+torch::Tensor opt_matmul_forward(torch::Tensor a, torch::Tensor b) {
+    TORCH_CHECK(a.is_cuda(), "inputs must be on cuda");
+    TORCH_CHECK(a.dtype() == torch::kFloat32, "inputs must be fp32");
+    TORCH_CHECK(b.is_cuda(), "inputs must be on cuda");
+    TORCH_CHECK(b.dtype() == torch::kFloat32, "inputs must be fp32");
+
+    const int64_t batch_size = a.size(0);
+    const int64_t m_size = a.size(1);
+    const int64_t k_size = a.size(2);
+    const int64_t n_size = b.size(2);
+
+    auto opts = a.options();
+    torch::Tensor c = torch::empty({batch_size, m_size, n_size}, opts);
+
+    dim3 block_size(32, 32, 1);
+    dim3 grid_size((m_size - 1) / block_size.x + 1, 
+                   (n_size - 1) / block_size.y + 1,
+                   batch_size);
+
+    #ifdef TIME_FLOPS
+    auto stream = at::cuda::getCurrentCUDAStream();
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start, stream.stream());
+    #endif
+
+    opt_matmul_forward_kernel<float><<<grid_size, block_size, 0, stream.stream()>>>(
+        a.data_ptr<float>(),
+        b.data_ptr<float>(),
+        c.data_ptr<float>(),
+        batch_size,
+        m_size,
+        n_size,
+        k_size
+    );
+
+    #ifdef TIME_FLOPS
+    cudaEventRecord(stop, stream.stream());
+    cudaEventSynchronize(stop);
+    float elapsed_time_ms;
+    cudaEventElapsedTime(&elapsed_time_ms, start, stop);
+    double sec_per_call = elapsed_time_ms/1e3;
+    double flops_per_call = 2.0 * static_cast<double>(batch_size) * static_cast<double>(m_size) * static_cast<double>(k_size) * static_cast<double>(n_size);
+    std::cout << "OPT matmul sizes: [" << m_size << "x" << k_size << "] * [" << k_size << "x" << n_size << "]" << std::endl;
+    std::cout << "OPT matmul TFLOP/s: " << flops_per_call / (sec_per_call*1e12) << std::endl;
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    #endif
+    
+    return c;
 }
