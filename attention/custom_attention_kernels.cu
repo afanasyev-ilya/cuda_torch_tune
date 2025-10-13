@@ -593,7 +593,7 @@ __global__ void opt_matmul_forward_kernel(const scalar_t* __restrict__ A,
             int c_row = MICRO_M * threadIdx.y + blockIdx.y * TILE_M + i;
             int c_col = MICRO_N * threadIdx.x + blockIdx.x * TILE_N + j;
             int c_idx = c_col + ldc * c_row + C_offset;
-            if(c_col < N_size && c_row < K_size)
+            if(c_col < N_size && c_row < M_size)
                 C[c_idx] = C_reg[i][j];
         }
     }
