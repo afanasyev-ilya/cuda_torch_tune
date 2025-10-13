@@ -41,7 +41,7 @@ def test_matmul_matches_pytorch(B, M, N, K):
 
 
 
-@pytest.mark.parametrize("B,M,N,K", [(1, 5, 7, 8), (2, 5, 5, 5), (1, 5, 10, 5)])
+@pytest.mark.parametrize("B,M,N,K", [(1, 2048, 2048, 2048), (1, 1024, 512, 2048)])
 def test_opt_matmul_matches_pytorch(B, M, N, K):
     class OptMatmul(Module):
         def __init__(self):

@@ -483,35 +483,119 @@ void opt_softmax_forward(torch::Tensor data) {
 
 ////////////////////////////////////////////// fused matmul /////////////////////////////////
 
+#define TILE_M 128
+#define TILE_K 16
+#define TILE_N 128
+
+#define BX 16
+#define BY 16
+
+#define MICRO_M 8 // 128/16
+#define MICRO_N 8 // 128/16
+
+static_assert(BX == TILE_N / MICRO_N, "BX must me = TILE_N / MICRO_N");
+static_assert(BY == TILE_M / MICRO_M, "BY must me = TILE_M / MICRO_M");
+
+
 template <typename scalar_t>
 __global__ void opt_matmul_forward_kernel(const scalar_t* __restrict__ A,
                                              const scalar_t* __restrict__ B,
                                              scalar_t* __restrict__ C,
-                                             size_t b_size,
-                                             size_t m_size,
-                                             size_t n_size, 
-                                             size_t k_size) {
+                                             size_t B_size,
+                                             size_t M_size,
+                                             size_t N_size, 
+                                             size_t K_size) {
     
     // Calculate global thread index within the batch dimension
+    int lda = K_size;
+    int ldb = N_size;
+    int ldc = N_size;
+
     int batch_idx = blockIdx.z;
+    int A_offset = batch_idx * M_size * K_size;
+    int B_offset = batch_idx * K_size * N_size;
+    int C_offset = batch_idx * M_size * N_size;
 
-    // Calculate global thread index within the output matrix C for the current batch
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    __shared__ float A_shared[TILE_M][TILE_K + 1];
+    __shared__ float B_shared[TILE_K][TILE_N + 1];
 
-    // Check if the thread is within the bounds of the output matrix C
-    if (row < m_size && col < n_size && batch_idx < b_size) {
-        float sum = 0.0f;
-        // Calculate the starting offset for the current batch's matrices
-        int A_offset = batch_idx * m_size * k_size;
-        int B_offset = batch_idx * k_size * n_size;
-        int C_offset = batch_idx * m_size * n_size;
+    int tid = threadIdx.x + blockDim.x * threadIdx.y;
+    int block_size = blockDim.x * blockDim.y;
 
-        // Perform the dot product for the current element C[row][col]
-        for (int k = 0; k < k_size; ++k) {
-            sum += A[A_offset + row * k_size + k] * B[B_offset + k * n_size + col];
+    float C_reg[MICRO_M][MICRO_N];
+    #pragma unroll
+    for(int i = 0; i < MICRO_M; i++) 
+        #pragma unroll
+        for(int j = 0; j < MICRO_N; j++)
+            C_reg[i][j] = 0.0;
+    
+    for(int k_start = 0; k_start < K_size; k_start += TILE_K) {
+        // load A tile
+        #pragma unroll
+        for(int i = tid; i < TILE_M * TILE_K; i += block_size) {
+            int local_row = i / TILE_K;
+            int local_col = i % TILE_K;
+            int global_col = k_start + local_col;
+            int global_row = TILE_M * blockIdx.y + local_row;
+            int a_idx = global_col + global_row * lda + A_offset;
+            float val = 0;
+            if(global_col < K_size && global_row < M_size)
+                val = A[a_idx];
+            A_shared[local_row][local_col] = val;
         }
-        C[C_offset + row * n_size + col] = sum;
+
+        // load B tile
+        #pragma unroll
+        for(int i = tid; i < TILE_N * TILE_K; i += block_size) {
+            int local_row = i / TILE_N;
+            int local_col = i % TILE_N;
+            int global_col = TILE_N * blockIdx.x + local_col;
+            int global_row = k_start + local_row;
+            int b_idx = global_col + global_row * ldb + B_offset;
+            float val = 0;
+            if(global_col < N_size && global_row < K_size)
+                val = B[b_idx];
+            B_shared[local_row][local_col] = val;
+        }
+
+        __syncthreads();
+
+        #pragma unroll
+        for(int k = 0; k < TILE_K; k++) {
+            float a_reg[MICRO_M];
+            float b_reg[MICRO_N];
+
+            #pragma unroll
+            for(int i = 0; i < MICRO_M; i++) { // this is first part of column of A (for first tile)
+                a_reg[i] = A_shared[i + MICRO_M * threadIdx.y][k];
+            }
+
+            #pragma unroll
+            for(int i = 0; i < MICRO_N; i++) { // this is first part of row of B (for first tile)
+                b_reg[i] = B_shared[k][i + MICRO_N * threadIdx.x];
+            }
+
+            #pragma unroll
+            for(int i = 0; i < MICRO_M; i++) {
+                for(int j = 0; j < MICRO_N; j++) {
+                    C_reg[i][j] += a_reg[i] * b_reg[j];
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for(int i = 0; i < MICRO_M; i++) {
+        #pragma unroll
+        for(int j = 0; j < MICRO_N; j++) {
+            int c_row = MICRO_M * threadIdx.y + blockIdx.y * TILE_M + i;
+            int c_col = MICRO_N * threadIdx.x + blockIdx.x * TILE_N + j;
+            int c_idx = c_col + ldc * c_row + C_offset;
+            if(c_col < K_size && c_row < N_size)
+                C[c_idx] = C_reg[i][j];
+        }
     }
 }
 
@@ -530,9 +614,9 @@ torch::Tensor opt_matmul_forward(torch::Tensor a, torch::Tensor b) {
     auto opts = a.options();
     torch::Tensor c = torch::empty({batch_size, m_size, n_size}, opts);
 
-    dim3 block_size(32, 32, 1);
-    dim3 grid_size((m_size - 1) / block_size.x + 1, 
-                   (n_size - 1) / block_size.y + 1,
+    dim3 block_size(BX, BY, 1);
+    dim3 grid_size((m_size - 1) / (BX * MICRO_M) + 1, 
+                   (n_size - 1) / (BY * MICRO_N) + 1,
                    batch_size);
 
     #ifdef TIME_FLOPS
