@@ -112,5 +112,6 @@ def test_eltwise_matches_pytorch(B, M, N, Val):
 
 # write code to see prints here
 test_matmul_matches_pytorch(1, 8192, 8192, 8192)
+test_matmul_matches_pytorch(4, 4096, 4096, 128)
 test_opt_matmul_matches_pytorch(1, 8192, 8192, 8192)
 test_opt_matmul_matches_pytorch(4, 4096, 4096, 128)
