@@ -102,8 +102,8 @@ torch::Tensor custom_matmul_forward(torch::Tensor a, torch::Tensor b) {
     torch::Tensor c = torch::empty({batch_size, m_size, n_size}, opts);
 
     dim3 block_size(32, 32, 1);
-    dim3 grid_size((m_size - 1) / block_size.x + 1, 
-                   (n_size - 1) / block_size.y + 1,
+    dim3 grid_size((n_size - 1) / block_size.x + 1, 
+                   (m_size - 1) / block_size.y + 1,
                    batch_size);
 
     #ifdef TIME_FLOPS
@@ -593,7 +593,7 @@ __global__ void opt_matmul_forward_kernel(const scalar_t* __restrict__ A,
             int c_row = MICRO_M * threadIdx.y + blockIdx.y * TILE_M + i;
             int c_col = MICRO_N * threadIdx.x + blockIdx.x * TILE_N + j;
             int c_idx = c_col + ldc * c_row + C_offset;
-            if(c_col < K_size && c_row < N_size)
+            if(c_col < N_size && c_row < K_size)
                 C[c_idx] = C_reg[i][j];
         }
     }
@@ -615,8 +615,8 @@ torch::Tensor opt_matmul_forward(torch::Tensor a, torch::Tensor b) {
     torch::Tensor c = torch::empty({batch_size, m_size, n_size}, opts);
 
     dim3 block_size(BX, BY, 1);
-    dim3 grid_size((m_size - 1) / (BX * MICRO_M) + 1, 
-                   (n_size - 1) / (BY * MICRO_N) + 1,
+    dim3 grid_size((n_size - 1) / (BX * MICRO_N) + 1, 
+                   (m_size - 1) / (BY * MICRO_M) + 1,
                    batch_size);
 
     #ifdef TIME_FLOPS
