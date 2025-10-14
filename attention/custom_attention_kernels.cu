@@ -481,7 +481,7 @@ void opt_softmax_forward(torch::Tensor data) {
     );
 }
 
-////////////////////////////////////////////// fused matmul /////////////////////////////////
+////////////////////////////////////////////// opt matmul /////////////////////////////////
 
 #define TILE_M 128
 #define TILE_K 16
@@ -651,4 +651,166 @@ torch::Tensor opt_matmul_forward(torch::Tensor a, torch::Tensor b) {
     #endif
     
     return c;
+}
+
+////////////////////////////////////////////// fused with online softmax and transpose /////////////////////////////////
+
+
+template <typename scalar_t>
+__global__ void flash_attention_kernel(const scalar_t* __restrict__ A,
+                                       const scalar_t* __restrict__ B,
+                                       scalar_t* __restrict__ C,
+                                       size_t B_size,
+                                       size_t M_size,
+                                       size_t N_size, 
+                                       size_t K_size,
+                                       scalar_t scale) {
+    
+    // Calculate global thread index within the batch dimension
+    int lda = K_size;
+    int ldb = N_size;
+    int ldc = N_size;
+
+    int batch_idx = blockIdx.z;
+    int A_offset = batch_idx * M_size * K_size;
+    int B_offset = batch_idx * K_size * N_size;
+    int C_offset = batch_idx * M_size * N_size;
+
+    __shared__ float A_shared[TILE_M][TILE_K + 1];
+    __shared__ float B_shared[TILE_K][TILE_N + 1];
+
+    int tid = threadIdx.x + blockDim.x * threadIdx.y;
+    int block_size = blockDim.x * blockDim.y;
+
+    float C_reg[MICRO_M][MICRO_N];
+    #pragma unroll
+    for(int i = 0; i < MICRO_M; i++) 
+        #pragma unroll
+        for(int j = 0; j < MICRO_N; j++)
+            C_reg[i][j] = 0.0;
+    
+    for(int k_start = 0; k_start < K_size; k_start += TILE_K) {
+        // load A tile
+        #pragma unroll
+        for(int i = tid; i < TILE_M * TILE_K; i += block_size) {
+            int local_row = i / TILE_K;
+            int local_col = i % TILE_K;
+            int global_col = k_start + local_col;
+            int global_row = TILE_M * blockIdx.y + local_row;
+            int a_idx = global_col + global_row * lda + A_offset;
+            float val = 0;
+            if(global_col < K_size && global_row < M_size)
+                val = A[a_idx];
+            A_shared[local_row][local_col] = val;
+        }
+
+        // load B tile
+        #pragma unroll
+        for(int i = tid; i < TILE_N * TILE_K; i += block_size) {
+            int local_row = i / TILE_N;
+            int local_col = i % TILE_N;
+            int global_col = TILE_N * blockIdx.x + local_col;
+            int global_row = k_start + local_row;
+            int b_idx = global_col + global_row * ldb + B_offset;
+            float val = 0;
+            if(global_col < N_size && global_row < K_size)
+                val = B[b_idx];
+            B_shared[local_row][local_col] = val;
+        }
+
+        __syncthreads();
+
+        #pragma unroll
+        for(int k = 0; k < TILE_K; k++) {
+            float a_reg[MICRO_M];
+            float b_reg[MICRO_N];
+
+            #pragma unroll
+            for(int i = 0; i < MICRO_M; i++) { // this is first part of column of A (for first tile)
+                a_reg[i] = A_shared[i + MICRO_M * threadIdx.y][k];
+            }
+
+            #pragma unroll
+            for(int i = 0; i < MICRO_N; i++) { // this is first part of row of B (for first tile)
+                b_reg[i] = B_shared[k][i + MICRO_N * threadIdx.x];
+            }
+
+            #pragma unroll
+            for(int i = 0; i < MICRO_M; i++) {
+                for(int j = 0; j < MICRO_N; j++) {
+                    C_reg[i][j] += a_reg[i] * b_reg[j];
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for(int i = 0; i < MICRO_M; i++) {
+        #pragma unroll
+        for(int j = 0; j < MICRO_N; j++) {
+            int c_row = MICRO_M * threadIdx.y + blockIdx.y * TILE_M + i;
+            int c_col = MICRO_N * threadIdx.x + blockIdx.x * TILE_N + j;
+            int c_idx = c_col + ldc * c_row + C_offset;
+            if(c_col < N_size && c_row < M_size)
+                C[c_idx] = C_reg[i][j];
+        }
+    }
+}
+
+
+torch::Tensor flash_attention_forward(torch::Tensor Q, torch::Tensor K, float scale) {
+    std::cout << "invoke flash attention\n";
+    TORCH_CHECK(Q.is_cuda(), "inputs must be on cuda");
+    TORCH_CHECK(Q.dtype() == torch::kFloat32, "inputs must be fp32");
+    TORCH_CHECK(K.is_cuda(), "inputs must be on cuda");
+    TORCH_CHECK(K.dtype() == torch::kFloat32, "inputs must be fp32");
+
+    const int64_t batch_size = Q.size(0);
+    const int64_t m_size = Q.size(1);
+    const int64_t k_size = Q.size(2);
+    const int64_t n_size = K.size(2);
+
+    auto opts = Q.options();
+    torch::Tensor scores = torch::empty({batch_size, m_size, n_size}, opts);
+
+    dim3 block_size(BX, BY, 1);
+    dim3 grid_size((n_size - 1) / (BX * MICRO_N) + 1, 
+                   (m_size - 1) / (BY * MICRO_M) + 1,
+                   batch_size);
+
+    #ifdef TIME_FLOPS
+    auto stream = at::cuda::getCurrentCUDAStream();
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start, stream.stream());
+    #endif
+
+    flash_attention_kernel<float><<<grid_size, block_size, 0, stream.stream()>>>(
+        Q.data_ptr<float>(),
+        K.data_ptr<float>(),
+        scores.data_ptr<float>(),
+        batch_size,
+        m_size,
+        n_size,
+        k_size, 
+        scale
+    );
+
+    #ifdef TIME_FLOPS
+    cudaEventRecord(stop, stream.stream());
+    cudaEventSynchronize(stop);
+    float elapsed_time_ms;
+    cudaEventElapsedTime(&elapsed_time_ms, start, stop);
+    double sec_per_call = elapsed_time_ms/1e3;
+    double flops_per_call = 2.0 * static_cast<double>(batch_size) * static_cast<double>(m_size) * static_cast<double>(k_size) * static_cast<double>(n_size);
+    std::cout << "flash attention sizes: [" << m_size << "x" << k_size << "] * [" << k_size << "x" << n_size << "]" << std::endl;
+    std::cout << "flash attention TFLOP/s: " << flops_per_call / (sec_per_call*1e12) << std::endl;
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    #endif
+    
+    return scores;
 }

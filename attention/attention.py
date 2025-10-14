@@ -186,6 +186,40 @@ def cuda_opt_layerwise_attention(Q, K, V):
     return attn_output
 
 
+def flash_attention(Q, K, V):
+    class FlashAttention(nn.Module):
+        def __init__(self, embed_dim):
+            super().__init__()
+            self.embed_dim = embed_dim
+
+        def cuda_flash_attention(self, query_input, key_input, scale_input):
+            return extensions().flash_attention_forward(query_input, key_input, scale_input)
+
+        def cuda_mamtul(self, a, b):
+            return extensions().custom_matmul_forward(a, b)
+
+        def cuda_softmax(self, input):
+            return extensions().custom_softmax_forward(input)
+
+        def cuda_eltwise_div(self, input, val):
+            return extensions().custom_eltwise_div_forward(input, val)
+
+        def forward(self, query, key, value):
+            scores = self.cuda_flash_attention(query, key, 1.0/math.sqrt(self.embed_dim))
+
+            attention_weights = self.cuda_softmax(scores)
+
+            attention_output = self.cuda_mamtul(attention_weights, value);
+
+            return attention_output
+    
+    attn = FlashAttention(embed_dim).cuda().eval()
+
+    attn_output = benchmark("cuda opt layerwise", attn, Q, K, V)
+
+    return attn_output
+
+
 def check(name, outs, ref):
     all_close = torch.allclose(outs, ref)
     print(f"{name} test all close? {all_close}")
@@ -205,10 +239,12 @@ def run_all():
     custom_res = layerwise_torch_attention(Q, K, V)
     cuda_naive_res = cuda_naive_attention(Q, K, V)
     cuda_opt_layerwise_res = cuda_opt_layerwise_attention(Q, K, V)
+    flash_attention_res = flash_attention(Q, K, V)
 
     check("custom torch", torch_res, custom_res)
     check("cuda naive", torch_res, cuda_naive_res)
     check("cuda layerwise opt", torch_res, cuda_opt_layerwise_res)
+    check("flash attention", torch_res, flash_attention_res)
 
     if DEBUG_MODE:
         print("build-in torch (ref): ------------ ")

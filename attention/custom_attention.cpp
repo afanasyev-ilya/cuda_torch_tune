@@ -8,6 +8,7 @@ torch::Tensor custom_eltwise_div_forward(torch::Tensor input, float val);
 torch::Tensor qkt_cublas_forward(torch::Tensor Q, torch::Tensor K, float scale);
 torch::Tensor pv_cublas_forward(torch::Tensor Probs, torch::Tensor V);
 void opt_softmax_forward(torch::Tensor data);
+torch::Tensor flash_attention_forward(torch::Tensor Q, torch::Tensor K, float scale);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("custom_transpose_forward", &custom_transpose_forward, "Custom transpose CUDA impl");
@@ -18,4 +19,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("qkt_cublas_forward", &qkt_cublas_forward, "Fused cublas Q*K^T impl");
     m.def("pv_cublas_forward", &pv_cublas_forward, "PV cublas impl");
     m.def("opt_softmax_forward", &opt_softmax_forward, "Optimized softmax CUDA impl");
+    m.def("flash_attention_forward", &flash_attention_forward, "Optimized CUDA flash attention impl");
 }
