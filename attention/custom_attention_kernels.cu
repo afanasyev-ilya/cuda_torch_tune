@@ -655,7 +655,6 @@ torch::Tensor opt_matmul_forward(torch::Tensor a, torch::Tensor b) {
 
 ////////////////////////////////////////////// fused with online softmax and transpose /////////////////////////////////
 
-
 template <typename scalar_t>
 __global__ void flash_attention_kernel(const scalar_t* __restrict__ A,
                                        const scalar_t* __restrict__ B,
@@ -668,7 +667,7 @@ __global__ void flash_attention_kernel(const scalar_t* __restrict__ A,
     
     // Calculate global thread index within the batch dimension
     int lda = K_size;
-    int ldb = N_size;
+    int ldb = K_size; // transpose
     int ldc = N_size;
 
     int batch_idx = blockIdx.z;
@@ -707,15 +706,15 @@ __global__ void flash_attention_kernel(const scalar_t* __restrict__ A,
         // load B tile
         #pragma unroll
         for(int i = tid; i < TILE_N * TILE_K; i += block_size) {
-            int local_row = i / TILE_N;
-            int local_col = i % TILE_N;
-            int global_col = TILE_N * blockIdx.x + local_col;
-            int global_row = k_start + local_row;
-            int b_idx = global_col + global_row * ldb + B_offset;
+            int local_k = i / TILE_N;
+            int local_n = i % TILE_N;
+            int global_k = k_start + local_k;
+            int global_n = TILE_N * blockIdx.x + local_n;
+            int b_idx = global_k + global_n * ldb + B_offset; // can we just do global_row + global_col * ldb + B_offset here?
             float val = 0;
-            if(global_col < N_size && global_row < K_size)
+            if(global_n < N_size && global_k < K_size)
                 val = B[b_idx];
-            B_shared[local_row][local_col] = val;
+            B_shared[local_k][local_n] = val; // it is already transposed
         }
 
         __syncthreads();
@@ -754,7 +753,7 @@ __global__ void flash_attention_kernel(const scalar_t* __restrict__ A,
             int c_col = MICRO_N * threadIdx.x + blockIdx.x * TILE_N + j;
             int c_idx = c_col + ldc * c_row + C_offset;
             if(c_col < N_size && c_row < M_size)
-                C[c_idx] = C_reg[i][j];
+                C[c_idx] = C_reg[i][j] * scale;
         }
     }
 }
@@ -770,7 +769,7 @@ torch::Tensor flash_attention_forward(torch::Tensor Q, torch::Tensor K, float sc
     const int64_t batch_size = Q.size(0);
     const int64_t m_size = Q.size(1);
     const int64_t k_size = Q.size(2);
-    const int64_t n_size = K.size(2);
+    const int64_t n_size = K.size(1); // transpose fusion change
 
     auto opts = Q.options();
     torch::Tensor scores = torch::empty({batch_size, m_size, n_size}, opts);
