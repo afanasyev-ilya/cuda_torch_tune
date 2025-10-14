@@ -681,81 +681,86 @@ __global__ void flash_attention_kernel(const scalar_t* __restrict__ A,
     int tid = threadIdx.x + blockDim.x * threadIdx.y;
     int block_size = blockDim.x * blockDim.y;
 
-    float C_reg[MICRO_M][MICRO_N];
-    #pragma unroll
-    for(int i = 0; i < MICRO_M; i++) 
+    // loop to replace N-side parallelism over C
+    for(int n_start = 0; n_start < N_size; n_start += TILE_N) {
+        // each block on this loop should be accumulated separatly and written in different locations of C
+        float C_reg[MICRO_M][MICRO_N];
         #pragma unroll
-        for(int j = 0; j < MICRO_N; j++)
-            C_reg[i][j] = 0.0;
-    
-    for(int k_start = 0; k_start < K_size; k_start += TILE_K) {
-        // load A tile
-        #pragma unroll
-        for(int i = tid; i < TILE_M * TILE_K; i += block_size) {
-            int local_row = i / TILE_K;
-            int local_col = i % TILE_K;
-            int global_col = k_start + local_col;
-            int global_row = TILE_M * blockIdx.y + local_row;
-            int a_idx = global_col + global_row * lda + A_offset;
-            float val = 0;
-            if(global_col < K_size && global_row < M_size)
-                val = A[a_idx];
-            A_shared[local_row][local_col] = val;
-        }
-
-        // load B tile
-        #pragma unroll
-        for(int i = tid; i < TILE_N * TILE_K; i += block_size) {
-            int local_k = i / TILE_N;
-            int local_n = i % TILE_N;
-            int global_k = k_start + local_k;
-            int global_n = TILE_N * blockIdx.x + local_n;
-            int b_idx = global_k + global_n * ldb + B_offset; // can we just do global_row + global_col * ldb + B_offset here?
-            float val = 0;
-            if(global_n < N_size && global_k < K_size)
-                val = B[b_idx];
-            B_shared[local_k][local_n] = val; // it is already transposed
-        }
-
-        __syncthreads();
-
-        #pragma unroll
-        for(int k = 0; k < TILE_K; k++) {
-            float a_reg[MICRO_M];
-            float b_reg[MICRO_N];
-
+        for(int i = 0; i < MICRO_M; i++) 
             #pragma unroll
-            for(int i = 0; i < MICRO_M; i++) { // this is first part of column of A (for first tile)
-                a_reg[i] = A_shared[i + MICRO_M * threadIdx.y][k];
+            for(int j = 0; j < MICRO_N; j++)
+                C_reg[i][j] = 0.0;
+
+        for(int k_start = 0; k_start < K_size; k_start += TILE_K) {
+            // load A tile
+            #pragma unroll
+            for(int i = tid; i < TILE_M * TILE_K; i += block_size) {
+                int local_row = i / TILE_K;
+                int local_col = i % TILE_K;
+                int global_col = k_start + local_col;
+                int global_row = TILE_M * blockIdx.y + local_row;
+                int a_idx = global_col + global_row * lda + A_offset;
+                float val = 0;
+                if(global_col < K_size && global_row < M_size)
+                    val = A[a_idx];
+                A_shared[local_row][local_col] = val;
             }
 
+            // load B tile
             #pragma unroll
-            for(int i = 0; i < MICRO_N; i++) { // this is first part of row of B (for first tile)
-                b_reg[i] = B_shared[k][i + MICRO_N * threadIdx.x];
+            for(int i = tid; i < TILE_N * TILE_K; i += block_size) {
+                int local_k = i / TILE_N;
+                int local_n = i % TILE_N;
+                int global_k = k_start + local_k;
+                int global_n = n_start + local_n;
+                int b_idx = global_k + global_n * ldb + B_offset; // can we just do global_row + global_col * ldb + B_offset here?
+                float val = 0;
+                if(global_n < N_size && global_k < K_size)
+                    val = B[b_idx];
+                B_shared[local_k][local_n] = val; // it is already transposed
             }
 
+            __syncthreads();
+
             #pragma unroll
-            for(int i = 0; i < MICRO_M; i++) {
-                for(int j = 0; j < MICRO_N; j++) {
-                    C_reg[i][j] += a_reg[i] * b_reg[j];
+            for(int k = 0; k < TILE_K; k++) {
+                float a_reg[MICRO_M];
+                float b_reg[MICRO_N];
+
+                #pragma unroll
+                for(int i = 0; i < MICRO_M; i++) { // this is first part of column of A (for first tile)
+                    a_reg[i] = A_shared[i + MICRO_M * threadIdx.y][k];
+                }
+
+                #pragma unroll
+                for(int i = 0; i < MICRO_N; i++) { // this is first part of row of B (for first tile)
+                    b_reg[i] = B_shared[k][i + MICRO_N * threadIdx.x];
+                }
+
+                #pragma unroll
+                for(int i = 0; i < MICRO_M; i++) {
+                    for(int j = 0; j < MICRO_N; j++) {
+                        C_reg[i][j] += a_reg[i] * b_reg[j];
+                    }
                 }
             }
+
+            __syncthreads();
         }
 
-        __syncthreads();
-    }
-
-    #pragma unroll
-    for(int i = 0; i < MICRO_M; i++) {
         #pragma unroll
-        for(int j = 0; j < MICRO_N; j++) {
-            int c_row = MICRO_M * threadIdx.y + blockIdx.y * TILE_M + i;
-            int c_col = MICRO_N * threadIdx.x + blockIdx.x * TILE_N + j;
-            int c_idx = c_col + ldc * c_row + C_offset;
-            if(c_col < N_size && c_row < M_size)
-                C[c_idx] = C_reg[i][j] * scale;
+        for(int i = 0; i < MICRO_M; i++) {
+            #pragma unroll
+            for(int j = 0; j < MICRO_N; j++) {
+                int c_row = MICRO_M * threadIdx.y + blockIdx.y * TILE_M + i;
+                int c_col = MICRO_N * threadIdx.x + n_start + j;
+                int c_idx = c_col + ldc * c_row + C_offset;
+                if(c_col < N_size && c_row < M_size)
+                    C[c_idx] = C_reg[i][j] * scale;
+            }
         }
     }
+
 }
 
 
@@ -775,7 +780,7 @@ torch::Tensor flash_attention_forward(torch::Tensor Q, torch::Tensor K, float sc
     torch::Tensor scores = torch::empty({batch_size, m_size, n_size}, opts);
 
     dim3 block_size(BX, BY, 1);
-    dim3 grid_size((n_size - 1) / (BX * MICRO_N) + 1, 
+    dim3 grid_size(1, 
                    (m_size - 1) / (BY * MICRO_M) + 1,
                    batch_size);
 
