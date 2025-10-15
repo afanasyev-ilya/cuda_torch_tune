@@ -192,30 +192,16 @@ def flash_attention(Q, K, V):
             super().__init__()
             self.embed_dim = embed_dim
 
-        def cuda_flash_attention(self, query_input, key_input, scale_input):
-            return extensions().flash_attention_forward(query_input, key_input, scale_input)
-
-        def cuda_mamtul(self, a, b):
-            return extensions().custom_matmul_forward(a, b)
-
-        def cuda_softmax(self, input):
-            return extensions().custom_softmax_forward(input)
-
-        def cuda_eltwise_div(self, input, val):
-            return extensions().custom_eltwise_div_forward(input, val)
+        def cuda_flash_attention(self, query_input, key_input, value, scale_input):
+            return extensions().flash_attention_forward(query_input, key_input, value, scale_input)
 
         def forward(self, query, key, value):
-            scores = self.cuda_flash_attention(query, key, 1.0/math.sqrt(self.embed_dim))
-
-            attention_weights = self.cuda_softmax(scores)
-
-            attention_output = self.cuda_mamtul(attention_weights, value);
-
+            attention_output = self.cuda_flash_attention(query, key, value, 1.0/math.sqrt(self.embed_dim))
             return attention_output
     
     attn = FlashAttention(embed_dim).cuda().eval()
 
-    attn_output = benchmark("cuda opt layerwise", attn, Q, K, V)
+    attn_output = benchmark("flash attention", attn, Q, K, V)
 
     return attn_output
 
