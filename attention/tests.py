@@ -2,6 +2,7 @@ import torch
 import pytest
 from torch.nn import Module
 from ext import extensions
+import time
 
 
 @pytest.mark.parametrize("B,M,N", [(1, 5, 7), (2, 6, 8)])
@@ -111,7 +112,60 @@ def test_eltwise_matches_pytorch(B, M, N, Val):
 
 
 # write code to see prints here
-test_matmul_matches_pytorch(1, 8192, 8192, 8192)
-test_matmul_matches_pytorch(4, 4096, 4096, 128)
-test_opt_matmul_matches_pytorch(1, 8192, 8192, 8192)
-test_opt_matmul_matches_pytorch(4, 4096, 4096, 128)
+#test_matmul_matches_pytorch(1, 8192, 8192, 8192)
+#test_matmul_matches_pytorch(4, 4096, 4096, 128)
+#test_opt_matmul_matches_pytorch(1, 8192, 8192, 8192)
+#test_opt_matmul_matches_pytorch(4, 4096, 4096, 128)
+
+def benchmark_mm(B, M, N, K):
+    class OptMatmul(Module):
+        def __init__(self):
+            super().__init__()
+            
+        def forward(self, a, b):
+            return extensions().opt_matmul_forward(a, b)
+
+    a = torch.randn(B, M, K).cuda()
+    b = torch.randn(B, K, N).cuda()
+
+    mm = OptMatmul().cuda().eval()
+
+    heat_runs = 2
+    for i in range(0, heat_runs):
+        out = mm(a, b)
+
+    avg_time = 0.0
+    min_time = 0.0
+    max_time = 0.0
+
+    benchmark_iters = 20
+    for iter in range(0, benchmark_iters):
+        torch.cuda.synchronize()
+        start = time.time()
+        mm(a, b)
+        torch.cuda.synchronize()
+        cur_time = (time.time() - start) * 1000
+        avg_time += cur_time / benchmark_iters
+        if min_time == 0:
+            min_time = cur_time
+        else:
+            min_time = min(cur_time, min_time)
+        if max_time == 0:
+            max_time = cur_time
+        else:
+            max_time = max(cur_time, max_time)
+
+    ops = 2 * B * M * K * N
+
+    print(f"Inference min perf: {ops / (1e9 * max_time)} TFlop/s")
+    print(f"Inference avg perf: {ops / (1e9 * avg_time)} TFlop/s")
+    print(f"Inference max perf: {ops / (1e9 * min_time)} TFlop/s")
+    print("\n\n")
+
+print("--------------- 8192x8192 & 8192x8192 -------------------")
+benchmark_mm(1, 8192, 8192, 8192)
+print("--------------- 4096x128 & 128x4096 -------------------")
+benchmark_mm(4, 4096, 4096, 128)
+
+print("--------------- 4096x256 & 256x4096 -------------------")
+benchmark_mm(4, 4096, 4096, 256)

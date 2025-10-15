@@ -5,7 +5,7 @@
 #include <cublas_v2.h>
 #include <ATen/cuda/CUDAContext.h>
 
-#define TIME_FLOPS
+//#define TIME_FLOPS
 
 template <typename scalar_t>
 __global__ void custom_transpose_forward_kernel(const scalar_t* __restrict__ input,
@@ -114,7 +114,7 @@ torch::Tensor custom_matmul_forward(torch::Tensor a, torch::Tensor b) {
     cudaEventRecord(start, stream.stream());
     #endif
 
-    custom_matmul_forward_kernel<float><<<grid_size, block_size, 0, stream.stream()>>>(
+    custom_matmul_forward_kernel<float><<<grid_size, block_size>>>(
         a.data_ptr<float>(),
         b.data_ptr<float>(),
         c.data_ptr<float>(),
@@ -627,7 +627,7 @@ torch::Tensor opt_matmul_forward(torch::Tensor a, torch::Tensor b) {
     cudaEventRecord(start, stream.stream());
     #endif
 
-    opt_matmul_forward_kernel<float><<<grid_size, block_size, 0, stream.stream()>>>(
+    opt_matmul_forward_kernel<float><<<grid_size, block_size>>>(
         a.data_ptr<float>(),
         b.data_ptr<float>(),
         c.data_ptr<float>(),
@@ -992,7 +992,7 @@ torch::Tensor flash_attention_forward(torch::Tensor Q, torch::Tensor K, torch::T
     cudaEventRecord(start, stream.stream());
     #endif
 
-    flash_attention_kernel<float><<<grid_size, block_size, 0, stream.stream()>>>(
+    flash_attention_kernel<float><<<grid_size, block_size>>>(
         Q.data_ptr<float>(),
         K.data_ptr<float>(),
         V.data_ptr<float>(),
