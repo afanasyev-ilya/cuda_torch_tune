@@ -117,7 +117,7 @@ def test_eltwise_matches_pytorch(B, M, N, Val):
 #test_opt_matmul_matches_pytorch(1, 8192, 8192, 8192)
 #test_opt_matmul_matches_pytorch(4, 4096, 4096, 128)
 
-def benchmark_mm(B, M, N, K):
+def benchmark_mm(B, M, N, K, heat_runs, benchmark_iters):
     class OptMatmul(Module):
         def __init__(self):
             super().__init__()
@@ -130,7 +130,6 @@ def benchmark_mm(B, M, N, K):
 
     mm = OptMatmul().cuda().eval()
 
-    heat_runs = 2
     for i in range(0, heat_runs):
         out = mm(a, b)
 
@@ -138,7 +137,6 @@ def benchmark_mm(B, M, N, K):
     min_time = 0.0
     max_time = 0.0
 
-    benchmark_iters = 20
     for iter in range(0, benchmark_iters):
         torch.cuda.synchronize()
         start = time.time()
@@ -162,10 +160,20 @@ def benchmark_mm(B, M, N, K):
     print(f"Inference max perf: {ops / (1e9 * min_time)} TFlop/s")
     print("\n\n")
 
-print("--------------- 8192x8192 & 8192x8192 -------------------")
-benchmark_mm(1, 8192, 8192, 8192)
-print("--------------- 4096x128 & 128x4096 -------------------")
-benchmark_mm(4, 4096, 4096, 128)
 
-print("--------------- 4096x256 & 256x4096 -------------------")
-benchmark_mm(4, 4096, 4096, 256)
+def benchmark_gemm():
+    heat_runs = 2
+    benchmark_iters = 20
+    print("--------------- 8192x8192 & 8192x8192 -------------------")
+    benchmark_mm(1, 8192, 8192, 8192, heat_runs, benchmark_iters)
+    print("--------------- 4096x128 & 128x4096 -------------------")
+    benchmark_mm(4, 4096, 4096, 128, heat_runs, benchmark_iters)
+
+    print("--------------- 4096x256 & 256x4096 -------------------")
+    benchmark_mm(4, 4096, 4096, 256, heat_runs, benchmark_iters)
+
+def profile_gemm():
+    print("--------------- 8192x8192 & 8192x8192 -------------------")
+    benchmark_mm(1, 8192, 8192, 8192, 1, 1)
+
+profile_gemm()
