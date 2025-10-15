@@ -485,13 +485,13 @@ void opt_softmax_forward(torch::Tensor data) {
 
 #define TILE_M 128
 #define TILE_K 16
-#define TILE_N 128
+#define TILE_N 96
 
 #define BX 16
 #define BY 16
 
-#define MICRO_M 8 // 128/16
-#define MICRO_N 8 // 128/16
+#define MICRO_M (TILE_M/BX) // 
+#define MICRO_N (TILE_N/BY) // changing 8 -> 6 gave +1.5 tflop
 
 static_assert(BX == TILE_N / MICRO_N, "BX must me = TILE_N / MICRO_N");
 static_assert(BY == TILE_M / MICRO_M, "BY must me = TILE_M / MICRO_M");
