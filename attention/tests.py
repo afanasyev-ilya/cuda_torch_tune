@@ -176,4 +176,5 @@ def profile_gemm():
     print("--------------- 8192x8192 & 8192x8192 -------------------")
     benchmark_mm(1, 8192, 8192, 8192, 1, 1)
 
-profile_gemm()
+benchmark_gemm()
+#profile_gemm()

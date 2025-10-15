@@ -516,8 +516,8 @@ __global__ void opt_matmul_forward_kernel(const scalar_t* __restrict__ A,
     int B_offset = batch_idx * K_size * N_size;
     int C_offset = batch_idx * M_size * N_size;
 
-    __shared__ float A_shared[TILE_M][TILE_K + 1];
-    __shared__ float B_shared[TILE_K][TILE_N + 1];
+    __shared__ float A_shared[2][TILE_M][TILE_K + 1];
+    __shared__ float B_shared[2][TILE_K][TILE_N + 1];
 
     int tid = threadIdx.x + blockDim.x * threadIdx.y;
     int block_size = blockDim.x * blockDim.y;
@@ -528,20 +528,24 @@ __global__ void opt_matmul_forward_kernel(const scalar_t* __restrict__ A,
         #pragma unroll
         for(int j = 0; j < MICRO_N; j++)
             C_reg[i][j] = 0.0;
-    
-    for(int k_start = 0; k_start < K_size; k_start += TILE_K) {
-        // load A tile
+
+    int cur = 0;
+
+    const int num_tiles = (K_size - 1) / TILE_K + 1;
+
+    // load first tile
+    {
         #pragma unroll
         for(int i = tid; i < TILE_M * TILE_K; i += block_size) {
             int local_row = i / TILE_K;
             int local_col = i % TILE_K;
-            int global_col = k_start + local_col;
+            int global_col = local_col;
             int global_row = TILE_M * blockIdx.y + local_row;
             int a_idx = global_col + global_row * lda + A_offset;
             float val = 0;
             if(global_col < K_size && global_row < M_size)
                 val = A[a_idx];
-            A_shared[local_row][local_col] = val;
+            A_shared[0][local_row][local_col] = val;
         }
 
         // load B tile
@@ -550,15 +554,53 @@ __global__ void opt_matmul_forward_kernel(const scalar_t* __restrict__ A,
             int local_row = i / TILE_N;
             int local_col = i % TILE_N;
             int global_col = TILE_N * blockIdx.x + local_col;
-            int global_row = k_start + local_row;
+            int global_row = local_row;
             int b_idx = global_col + global_row * ldb + B_offset;
             float val = 0;
             if(global_col < N_size && global_row < K_size)
                 val = B[b_idx];
-            B_shared[local_row][local_col] = val;
+            B_shared[0][local_row][local_col] = val;
         }
 
         __syncthreads();
+    }
+    
+    for(int t = 0; t < num_tiles; t++) {
+        int k_start = t * TILE_K;
+
+        int next = cur ^ 1;
+
+        if(t + 1 < num_tiles) {
+            int k_next_start = (t + 1) * TILE_K;
+
+            // load A tile
+            #pragma unroll
+            for(int i = tid; i < TILE_M * TILE_K; i += block_size) {
+                int local_row = i / TILE_K;
+                int local_col = i % TILE_K;
+                int global_col = k_next_start + local_col;
+                int global_row = TILE_M * blockIdx.y + local_row;
+                int a_idx = global_col + global_row * lda + A_offset;
+                float val = 0;
+                if(global_col < K_size && global_row < M_size)
+                    val = A[a_idx];
+                A_shared[next][local_row][local_col] = val;
+            }
+
+            // load B tile
+            #pragma unroll
+            for(int i = tid; i < TILE_N * TILE_K; i += block_size) {
+                int local_row = i / TILE_N;
+                int local_col = i % TILE_N;
+                int global_col = TILE_N * blockIdx.x + local_col;
+                int global_row = k_next_start + local_row;
+                int b_idx = global_col + global_row * ldb + B_offset;
+                float val = 0;
+                if(global_col < N_size && global_row < K_size)
+                    val = B[b_idx];
+                B_shared[next][local_row][local_col] = val;
+            }
+        }
 
         #pragma unroll
         for(int k = 0; k < TILE_K; k++) {
@@ -567,12 +609,12 @@ __global__ void opt_matmul_forward_kernel(const scalar_t* __restrict__ A,
 
             #pragma unroll
             for(int i = 0; i < MICRO_M; i++) { // this is first part of column of A (for first tile)
-                a_reg[i] = A_shared[i + MICRO_M * threadIdx.y][k];
+                a_reg[i] = A_shared[cur][i + MICRO_M * threadIdx.y][k];
             }
 
             #pragma unroll
             for(int i = 0; i < MICRO_N; i++) { // this is first part of row of B (for first tile)
-                b_reg[i] = B_shared[k][i + MICRO_N * threadIdx.x];
+                b_reg[i] = B_shared[cur][k][i + MICRO_N * threadIdx.x];
             }
 
             #pragma unroll
@@ -584,6 +626,8 @@ __global__ void opt_matmul_forward_kernel(const scalar_t* __restrict__ A,
         }
 
         __syncthreads();
+
+        cur ^= 1;
     }
 
     #pragma unroll
