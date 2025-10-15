@@ -496,17 +496,15 @@ void opt_softmax_forward(torch::Tensor data) {
 static_assert(BX == TILE_N / MICRO_N, "BX must me = TILE_N / MICRO_N");
 static_assert(BY == TILE_M / MICRO_M, "BY must me = TILE_M / MICRO_M");
 
-#define TILE_DV (BX * MICRO_N)
-
-
 template <typename scalar_t>
+__global__ __launch_bounds__(BX*BY, 2)
 __global__ void opt_matmul_forward_kernel(const scalar_t* __restrict__ A,
-                                             const scalar_t* __restrict__ B,
-                                             scalar_t* __restrict__ C,
-                                             size_t B_size,
-                                             size_t M_size,
-                                             size_t N_size, 
-                                             size_t K_size) {
+                                          const scalar_t* __restrict__ B,
+                                          scalar_t* __restrict__ C,
+                                          const int B_size,
+                                          const int M_size,
+                                          const int N_size, 
+                                          const int K_size) {
     
     // Calculate global thread index within the batch dimension
     int lda = K_size;
@@ -656,6 +654,21 @@ torch::Tensor opt_matmul_forward(torch::Tensor a, torch::Tensor b) {
 }
 
 ////////////////////////////////////////////// fused with online softmax and transpose /////////////////////////////////
+
+#define TILE_M 128
+#define TILE_K 16
+#define TILE_N 128
+
+#define BX 16
+#define BY 16
+
+#define MICRO_M 8 // 128/16
+#define MICRO_N 8 // 128/16
+
+static_assert(BX == TILE_N / MICRO_N, "BX must me = TILE_N / MICRO_N");
+static_assert(BY == TILE_M / MICRO_M, "BY must me = TILE_M / MICRO_M");
+
+#define TILE_DV (BX * MICRO_N)
 
 template <typename scalar_t>
 __global__ void flash_attention_kernel(const scalar_t* __restrict__ Q,
