@@ -14,9 +14,9 @@ if DEBUG_MODE:
     embed_dim = 4
     num_heads = 1
 else:
-    batch_size = 4
+    batch_size = 8
     seq_len = 4096 # as in llama2
-    embed_dim = 128 # as in llama2
+    embed_dim = 256 # as in llama2
     num_heads = 1
 
 
@@ -250,6 +250,8 @@ def run():
 
     cuda_naive_res = cuda_opt_layerwise_attention(Q, K, V)
 
+    fa = flash_attention(Q, K, V)
+
 
 if __name__ == "__main__":
-    run_all()
+    run()
