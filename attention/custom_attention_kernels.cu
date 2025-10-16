@@ -5,7 +5,7 @@
 #include <cublas_v2.h>
 #include <ATen/cuda/CUDAContext.h>
 
-//#define TIME_FLOPS
+#define TIME_FLOPS
 
 template <typename scalar_t>
 __global__ void custom_transpose_forward_kernel(const scalar_t* __restrict__ input,
@@ -132,7 +132,7 @@ torch::Tensor custom_matmul_forward(torch::Tensor a, torch::Tensor b) {
     double sec_per_call = elapsed_time_ms/1e3;
     double flops_per_call = 2.0 * static_cast<double>(batch_size) * static_cast<double>(m_size) * static_cast<double>(k_size) * static_cast<double>(n_size);
     std::cout << "NAIVE matmul sizes: [" << m_size << "x" << k_size << "] * [" << k_size << "x" << n_size << "]" << std::endl;
-    std::cout << "NAIVE matmul TFLOP/s: " << flops_per_call / (sec_per_call*1e12) << std::endl;
+    std::cout << "NAIVE matmul perf: " << flops_per_call / (sec_per_call*1e12) << " TFLOP/s" << std::endl;
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
     #endif
@@ -289,7 +289,7 @@ torch::Tensor qkt_cublas_forward(torch::Tensor Q, torch::Tensor K, float scale) 
     double sec_per_call = elapsed_time_ms/1e3;
     double flops_per_call = 2.0 * static_cast<double>(B) * static_cast<double>(S) * static_cast<double>(S) * static_cast<double>(D);
     std::cout << "qkt sizes: [" << S << "x" << D << "] * [" << D << "x" << S << "]" << std::endl;
-    std::cout << "qkt TFLOP/s: " << flops_per_call / (sec_per_call*1e12) << std::endl;
+    std::cout << "qkt perf: " << flops_per_call / (sec_per_call*1e12)<< " TFLOP/s" << std::endl;
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
     #endif
@@ -370,7 +370,7 @@ torch::Tensor pv_cublas_forward(torch::Tensor Probs, torch::Tensor V) {
     double sec_per_call = elapsed_time_ms/1e3;
     double flops_per_call = 2.0 * static_cast<double>(B) * static_cast<double>(D) * static_cast<double>(S) * static_cast<double>(S);
     std::cout << "   pv sizes: [" << D << "x" << S << "] * [" << S << "x" << S << "]" << std::endl;
-    std::cout << "   pv TFLOP/s: " << flops_per_call / (sec_per_call*1e12) << std::endl;
+    std::cout << "   pv perf: " << flops_per_call / (sec_per_call*1e12) << " TFLOP/s" << std::endl;
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
     #endif
@@ -645,7 +645,7 @@ torch::Tensor opt_matmul_forward(torch::Tensor a, torch::Tensor b) {
     double sec_per_call = elapsed_time_ms/1e3;
     double flops_per_call = 2.0 * static_cast<double>(batch_size) * static_cast<double>(m_size) * static_cast<double>(k_size) * static_cast<double>(n_size);
     std::cout << "OPT matmul sizes: [" << m_size << "x" << k_size << "] * [" << k_size << "x" << n_size << "]" << std::endl;
-    std::cout << "OPT matmul TFLOP/s: " << flops_per_call / (sec_per_call*1e12) << std::endl;
+    std::cout << "OPT matmul perf: " << flops_per_call / (sec_per_call*1e12) << " TFLOP/s" << std::endl;
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
     #endif
@@ -1015,10 +1015,7 @@ torch::Tensor flash_attention_forward(torch::Tensor Q, torch::Tensor K, torch::T
     double flops_pv = 2.0 * static_cast<double>(batch_size) * static_cast<double>(m_size) * static_cast<double>(n_size) * static_cast<double>(dv_size);
     double flops_per_call = flops_qk + flops_pv;
     std::cout << "flash attention sizes: [" << m_size << "x" << k_size << "] * [" << k_size << "x" << n_size << "]" << std::endl;
-    print_shape(Q);
-    print_shape(K);
-    print_shape(V);
-    std::cout << "flash attention TFLOP/s: " << flops_per_call / (sec_per_call*1e12) << std::endl;
+    std::cout << "flash attention perf: " << flops_per_call / (sec_per_call*1e12) << " TFLOP/s" << std::endl;
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
     #endif
