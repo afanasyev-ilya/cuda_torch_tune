@@ -701,7 +701,7 @@ __global__ void flash_attention_kernel_fp32_static(
     const float* __restrict__ K,  // [B, N, D]
     const float* __restrict__ V,  // [B, N, DV]
     float* __restrict__ O,        // [B, M, DV]
-    int Bsz, int M, int N, int D, int DV,
+    int Bsz, int M, int N, int D, int DV_size,
     float scale)
 {
     const int b  = blockIdx.z;  // batch/head idx
@@ -720,8 +720,8 @@ __global__ void flash_attention_kernel_fp32_static(
     // Base offsets for this batch
     const int64_t Qb_offset = (int64_t)b * M * D;
     const int64_t Kb_offset = (int64_t)b * N * D;
-    const int64_t Vb_offset = (int64_t)b * N * DV;
-    const int64_t Ob_offset = (int64_t)b * M * DV;
+    const int64_t Vb_offset = (int64_t)b * N * DV_size;
+    const int64_t Ob_offset = (int64_t)b * M * DV_size;
 
     // -------------------- STATIC SHARED TILES --------------------
     // +1 padding on fastest dimension to reduce bank conflicts.
@@ -729,7 +729,7 @@ __global__ void flash_attention_kernel_fp32_static(
     __shared__ float Ks[BC][D_MAX + 1];         // BC x D
     __shared__ float Vs[BC][DV_CHUNK + 1];      // BC x DV_CHUNK
 
-    // --------- Load Q slab (Br x D) into shared ---------
+    // --------- Load group of Q FULL rows (Br x D) into shared ---------
     {
         // Each row-owner thread loads its row (D contiguous floats)
         const float* q_src = Q + Qb_offset + (int64_t)i * D;
@@ -745,8 +745,9 @@ __global__ void flash_attention_kernel_fp32_static(
     float l_row = 0.f;
 
     // Process output cols in small chunks to limit register pressure
-    for (int dv0 = 0; dv0 < DV; dv0 += DV_CHUNK) {
-        const int dv_lim = min(DV_CHUNK, DV - dv0);
+    for (int dv_start = 0; dv_start < DV_size; dv_start += DV_CHUNK) {
+        const int dv_lim = min(DV_CHUNK, DV_size - dv_start);
+
         float o_chunk[DV_CHUNK];
         #pragma unroll
         for (int t = 0; t < DV_CHUNK; ++t) 
@@ -767,10 +768,11 @@ __global__ void flash_attention_kernel_fp32_static(
             for (int idx = tx; idx < n_lim * dv_lim; idx += BR) {
                 int r = idx / dv_lim;     // 0..n_lim-1
                 int c = idx - r * dv_lim; // 0..dv_lim-1
-                Vs[r][c] = V[Vb_offset + (int64_t)(n0 + r) * DV + (dv0 + c)];
+                Vs[r][c] = V[Vb_offset + (int64_t)(n0 + r) * DV_size + (dv_start + c)];
             }
             __syncthreads();
 
+            // multiply Q x K^T, BR D-sized rows x BC D-sized cols
             // Compute scores s_j for this row i against this tile
             float s_local[BC];  // uses compile-time bound
             #pragma unroll
@@ -780,14 +782,16 @@ __global__ void flash_attention_kernel_fp32_static(
                 float dot = 0.f;
                 // FMAs over D (optionally vectorize with float4 when D%4==0)
                 for (int d = 0; d < D; ++d) 
-                dot = fmaf(q_row[d], k_row[d], dot);
+                    dot = fmaf(q_row[d], k_row[d], dot);
                 s_local[j] = dot * scale;
             }
 
-            // Online softmax update
+            // Online running softmax update
+            // for each BR row each thread find max in scores block (BC), traversing each row in a loop to find max
             float m_tile = -INFINITY;
             #pragma unroll
-            for (int j = 0; j < n_lim; ++j) m_tile = fmaxf(m_tile, s_local[j]);
+            for (int j = 0; j < n_lim; ++j) 
+                m_tile = fmaxf(m_tile, s_local[j]);
             const float m_new = fmaxf(m_row, m_tile);
 
             float sum_exp = 0.f;
@@ -807,15 +811,17 @@ __global__ void flash_attention_kernel_fp32_static(
 
             // o = o*alpha + Σ_j (p_local[j]*inv_l_new) * v_j
             #pragma unroll
-            for (int t = 0; t < dv_lim; ++t) o_chunk[t] *= alpha;
+            for (int t = 0; t < dv_lim; ++t) 
+                o_chunk[t] *= alpha;
 
+            // multiply scores x V
             #pragma unroll
             for (int j = 0; j < n_lim; ++j) {
                 const float beta = p_local[j] * inv_l_new;
                 const float* v_row = &Vs[j][0];
                 #pragma unroll
                 for (int t = 0; t < dv_lim; ++t) {
-                    o_chunk[t] = fmaf(beta, v_row[t], o_chunk[t]);
+                    o_chunk[t] = fmaf(beta, o_chunk[t], v_row[t]);
                 }
             }
 
@@ -827,7 +833,7 @@ __global__ void flash_attention_kernel_fp32_static(
         } // tiles on N
 
         // Store output chunk for row i
-        float* o_dst = O + Ob_offset + (int64_t)i * DV + dv0;
+        float* o_dst = O + Ob_offset + (int64_t)i * DV_size + dv_start;
         #pragma unroll
         for (int t = 0; t < dv_lim; ++t) 
             o_dst[t] = o_chunk[t];
