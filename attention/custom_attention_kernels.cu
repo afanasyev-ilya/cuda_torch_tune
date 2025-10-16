@@ -655,370 +655,240 @@ torch::Tensor opt_matmul_forward(torch::Tensor a, torch::Tensor b) {
 
 ////////////////////////////////////////////// fused with online softmax and transpose /////////////////////////////////
 
-#define TILE_M 128
-#define TILE_K 16
-#define TILE_N 128
+// -------------------- TUNABLE LIMITS / TILES --------------------
+// Br: # query rows per CTA (tile along M = q_seq)
+// Bc: # key/value rows per tile (tile along N = kv_seq)
+// D_MAX: compile-time upper bound for head dim (D)
+// DV_CHUNK: process V/output in small column chunks (register control)
 
-#define BX 16
-#define BY 16
+#define BR 32
 
-#define MICRO_M 8 // 128/16
-#define MICRO_N 8 // 128/16
+#define BC 48
 
-static_assert(BX == TILE_N / MICRO_N, "BX must me = TILE_N / MICRO_N");
-static_assert(BY == TILE_M / MICRO_M, "BY must me = TILE_M / MICRO_M");
+#define D_MAX 128
 
-#define TILE_DV (BX * MICRO_N)
+#define DV_CHUNK 32
 
-template <typename scalar_t>
-__global__ void flash_attention_kernel(const scalar_t* __restrict__ Q,
-                                       const scalar_t* __restrict__ K,
-                                       const scalar_t* __restrict__ V,
-                                       scalar_t* __restrict__ O,
-                                       size_t B_size,
-                                       size_t M_size,
-                                       size_t N_size, 
-                                       size_t K_size,
-                                       size_t DV_size,
-                                       scalar_t scale) {
-    
-    // Calculate global thread index within the batch dimension
-    int ldq = K_size; // Q [MxK]
-    int ldk = K_size; // K [NxK] -> [KxN]
-    int ldv = DV_size; // V size [N x dv]
-    int ldo = DV_size; // O size [M x dv]
 
-    int batch_idx = blockIdx.z;
-    int Q_offset = batch_idx * M_size * K_size;
-    int K_offset = batch_idx * K_size * N_size;
-    int V_offset = batch_idx * N_size * DV_size;
-    int O_offset = batch_idx * M_size * DV_size;
+// Shared memory footprint (floats):
+//   Qs: BR*(D_MAX+1)
+//   Ks: BC*(D_MAX+1)
+//   Vs: BC*(DV_CHUNK+1)
+// Example with BR=32, BC=48, D_MAX=128, DV_CHUNK=32:
+//   32*129 + 48*129 + 48*33 = 11,904 floats ≈ 46.5 KB
 
-    __shared__ float Q_shared[TILE_M][TILE_K + 1];
-    __shared__ float K_shared[TILE_K][TILE_N + 1];
+// -------------------- DIMENSION SEMANTICS --------------------
+//
+// Q: [B, M, D]    (batch, q_seq_len,  head_dim_kq)
+// K: [B, N, D]    (batch, kv_seq_len, head_dim_kq)
+// V: [B, N, DV]   (batch, kv_seq_len, head_dim_v)
+// O: [B, M, DV]   (batch, q_seq_len,  head_dim_v)
+//
+// Grid: (x=1, y=ceil(M/BR), z=B)  -> one CTA owns BR query rows
+// Block: (x=BR, y=1, z=1)         -> 1 thread per query row inside CTA
+//
+// Online softmax per row i (m,l in registers):
+//   s_j   = <q_i, k_j> * scale  for j in current K/V tile
+//   m_new = max(m, max_j s_j)
+//   l_new = l * exp(m - m_new) + sum_j exp(s_j - m_new)
+//   o_new = o * (l * exp(m - m_new) / l_new)
+//         + sum_j [exp(s_j - m_new) / l_new] * v_j
+//
+// No NxN attention is materialized; we stream over K/V tiles.
 
-    int tid = threadIdx.x + blockDim.x * threadIdx.y;
-    int block_size = blockDim.x * blockDim.y;
+__global__ void flash_attention_kernel_fp32_static(
+    const float* __restrict__ Q,  // [B, M, D]
+    const float* __restrict__ K,  // [B, N, D]
+    const float* __restrict__ V,  // [B, N, DV]
+    float* __restrict__ O,        // [B, M, DV]
+    int Bsz, int M, int N, int D, int DV,
+    float scale)
+{
+    const int b  = blockIdx.z;  // batch/head idx
+    const int tb = blockIdx.y;  // which BR-slab of M
+    const int tx = threadIdx.x; // row-owner within the slab [0..Br)
 
-    // Online softmax per-row state for the 128 rows owned by this CTA
-    __shared__ float row_m[TILE_M];                  // running max
-    __shared__ float row_l[TILE_M];                  // running sum of exp(score - m)
+    const int i  = tb * BR + tx;  // absolute query row
 
-    // Reduction scratch across THREADS_X (=BX) for 128 rows
-    __shared__ float tile_row_max[TILE_M][BX];       // store per-thread partial maxima
-    __shared__ float tile_row_sum[TILE_M][BX];       // store per-thread partial sums
+    if (tx >= BR || i >= M)
+        return;
 
-    // 8-wide slices for E8·V8 micro-GEMMs (K=8)
-    __shared__ float E8[TILE_M][MICRO_N];            // 128 x 8, exp(score - new_m)
-    __shared__ float V8[MICRO_N][TILE_DV + 1];       // 8 x TILE_DV (+1 pad)
+    // Bounds guard for static shared layout
+    if (D > D_MAX) 
+        return;  // (guard; also asserted in host wrapper)
 
-    if(threadIdx.x == 0) {
-        for(int i = 0; i < TILE_M; i++) {
-            row_m[i] = std::numeric_limits<float>::min();
-            row_l[i] = 0;
-        }
+    // Base offsets for this batch
+    const int64_t Qb_offset = (int64_t)b * M * D;
+    const int64_t Kb_offset = (int64_t)b * N * D;
+    const int64_t Vb_offset = (int64_t)b * N * DV;
+    const int64_t Ob_offset = (int64_t)b * M * DV;
+
+    // -------------------- STATIC SHARED TILES --------------------
+    // +1 padding on fastest dimension to reduce bank conflicts.
+    __shared__ float Qs[BR][D_MAX + 1];         // BR x D
+    __shared__ float Ks[BC][D_MAX + 1];         // BC x D
+    __shared__ float Vs[BC][DV_CHUNK + 1];      // BC x DV_CHUNK
+
+    // --------- Load Q slab (Br x D) into shared ---------
+    {
+        // Each row-owner thread loads its row (D contiguous floats)
+        const float* q_src = Q + Qb_offset + (int64_t)i * D;
+        float* q_dst = &Qs[tx][0];
+        // Only use the first D elements (D_MAX is the static bound)
+        for (int d = 0; d < D; ++d)
+            q_dst[d] = q_src[d];
     }
-
-    // This CTA writes O for rows [M tile] and Dv columns [dv_start : dv_start+TILE_DV)
-    const int dv_start = blockIdx.x * TILE_DV;
-
     __syncthreads();
 
-    float O_reg[MICRO_M][MICRO_N];
-    for (int i = 0; i < MICRO_M; ++i)
-        for (int j = 0; j < MICRO_N; ++j)
-            O_reg[i][j] = 0.f;
+    // Per-row running softmax stats in registers
+    float m_row = -INFINITY;
+    float l_row = 0.f;
 
-    // loop to replace N-side parallelism over C
-    for(int n_start = 0; n_start < N_size; n_start += TILE_N) {
-        // each block on this loop should be accumulated separatly and written in different locations of C
-        float C_reg[MICRO_M][MICRO_N];
+    // Process output cols in small chunks to limit register pressure
+    for (int dv0 = 0; dv0 < DV; dv0 += DV_CHUNK) {
+        const int dv_lim = min(DV_CHUNK, DV - dv0);
+        float o_chunk[DV_CHUNK];
         #pragma unroll
-        for(int i = 0; i < MICRO_M; i++) 
-            #pragma unroll
-            for(int j = 0; j < MICRO_N; j++)
-                C_reg[i][j] = 0.0;
+        for (int t = 0; t < DV_CHUNK; ++t) 
+            o_chunk[t] = 0.f;
 
-        for(int k_start = 0; k_start < K_size; k_start += TILE_K) {
-            // load Q tile
-            #pragma unroll
-            for(int i = tid; i < TILE_M * TILE_K; i += block_size) {
-                int local_row = i / TILE_K;
-                int local_col = i % TILE_K;
-                int global_col = k_start + local_col;
-                int global_row = TILE_M * blockIdx.y + local_row;
-                int q_idx = global_col + global_row * ldq + Q_offset;
-                float val = 0;
-                if(global_col < K_size && global_row < M_size)
-                    val = Q[q_idx];
-                Q_shared[local_row][local_col] = val;
+        // --------- Loop over K/V tiles along N ---------
+        for (int n0 = 0; n0 < N; n0 += BC) {
+            const int n_lim = min(BC, N - n0);
+
+            // Load K tile: [n_lim, D] -> Ks
+            for (int idx = tx; idx < n_lim * D; idx += BR) {
+                int r = idx / D;    // 0..n_lim-1
+                int c = idx - r * D;// 0..D-1
+                Ks[r][c] = K[Kb_offset + (int64_t)(n0 + r) * D + c];
             }
 
-            // load Q tile
-            #pragma unroll
-            for(int i = tid; i < TILE_N * TILE_K; i += block_size) {
-                int local_k = i / TILE_N;
-                int local_n = i % TILE_N;
-                int global_k = k_start + local_k;
-                int global_n = n_start + local_n;
-                int k_idx = global_k + global_n * ldk + K_offset; // can we just do global_row + global_col * ldb + B_offset here?
-                float val = 0;
-                if(global_n < N_size && global_k < K_size)
-                    val = K[k_idx];
-                K_shared[local_k][local_n] = val; // it is already transposed
-            }
-
-            __syncthreads();
-
-            #pragma unroll
-            for(int k = 0; k < TILE_K; k++) {
-                float q_reg[MICRO_M];
-                float k_reg[MICRO_N];
-
-                #pragma unroll
-                for(int i = 0; i < MICRO_M; i++) { // this is first part of column of A (for first tile)
-                    q_reg[i] = Q_shared[i + MICRO_M * threadIdx.y][k];
-                }
-
-                #pragma unroll
-                for(int i = 0; i < MICRO_N; i++) { // this is first part of row of B (for first tile)
-                    k_reg[i] = K_shared[k][i + MICRO_N * threadIdx.x];
-                }
-
-                #pragma unroll
-                for(int i = 0; i < MICRO_M; i++) {
-                    for(int j = 0; j < MICRO_N; j++) {
-                        C_reg[i][j] += q_reg[i] * k_reg[j];
-                    }
-                }
-            }
-
-            __syncthreads();
-        }
-
-        // Scale scores by 1/sqrt(d)
-        #pragma unroll
-        for(int i = 0; i < MICRO_M; i++) {
-            #pragma unroll
-            for(int j = 0; j < MICRO_N; j++) {
-                C_reg[i][j] *= scale;
-            }
-        }
-
-        // ---- Row-wise tile max → new_m
-        float row_max_local[MICRO_M];
-        #pragma unroll
-        for (int i = 0; i < MICRO_M; ++i) 
-            row_max_local[i] = -INFINITY;
-
-        // max reduction in each row
-        #pragma unroll
-        for (int i = 0; i < MICRO_M; ++i)
-            #pragma unroll
-            for (int j = 0; j < MICRO_N; ++j)
-                row_max_local[i] = fmaxf(row_max_local[i], C_reg[i][j]);
-
-        // prepare for reduction withing block
-        #pragma unroll
-        for (int i = 0; i < MICRO_M; ++i) {
-            int r = threadIdx.y * MICRO_M + i;
-            tile_row_max[r][threadIdx.x] = row_max_local[i];
-        }
-        __syncthreads();
-
-        // reduction of max in C inside block
-        if (threadIdx.x == 0) {
-            #pragma unroll
-            for (int g = 0; g < MICRO_M; ++g) {
-                int r = threadIdx.y * MICRO_M + g;
-                float mx = -INFINITY;
-                #pragma unroll
-                for (int c = 0; c < BX; ++c) 
-                    mx = fmaxf(mx, tile_row_max[r][c]);
-                tile_row_max[r][0] = fmaxf(row_m[r], mx); // new_m
-            }
-        }
-        __syncthreads();
-
-        float new_m_local[MICRO_M];
-        #pragma unroll
-        for (int i = 0; i < MICRO_M; ++i) {
-            int r = threadIdx.y * MICRO_M + i;
-            new_m_local[i] = tile_row_max[r][0];
-        }
-
-        // ---- Rescale Ō by exp(old_m - new_m)
-        #pragma unroll
-        for (int i = 0; i < MICRO_M; ++i) {
-            int r = threadIdx.y * MICRO_M + i;
-            float rescale = __expf(row_m[r] - new_m_local[i]);
-            #pragma unroll
-            for (int j = 0; j < MICRO_N; ++j)
-                O_reg[i][j] *= rescale;
-        }
-
-        // zero partial row-sum slots
-        #pragma unroll
-        for (int i = 0; i < MICRO_M; ++i) {
-            int r = threadIdx.y * MICRO_M + i;
-            tile_row_sum[r][threadIdx.x] = 0.f;
-        }
-        __syncthreads();
-
-
-        // ---- Stream the 128-key tile in 8-wide stripes and do E8·V8
-        for (int owner = 0; owner < BX; ++owner) {
-            // owner writes E8 = exp(score - new_m) for its 8 columns
-            if (threadIdx.x == owner) {
-                #pragma unroll
-                for (int i = 0; i < MICRO_M; ++i) {
-                    int r = threadIdx.y * MICRO_M + i;
-                    float sum_part = 0.f;
-                    #pragma unroll
-                    for (int j = 0; j < MICRO_N; ++j) {
-                        float e = __expf(C_reg[i][j] - new_m_local[i]);
-                        E8[r][j] = e;
-                        sum_part += e;
-                    }
-                    tile_row_sum[r][threadIdx.x] += sum_part; // accumulate per stripe
-                }
+            // Load V tile slice: [n_lim, dv_lim] -> Vs
+            for (int idx = tx; idx < n_lim * dv_lim; idx += BR) {
+                int r = idx / dv_lim;     // 0..n_lim-1
+                int c = idx - r * dv_lim; // 0..dv_lim-1
+                Vs[r][c] = V[Vb_offset + (int64_t)(n0 + r) * DV + (dv0 + c)];
             }
             __syncthreads();
 
-            // load V8 for these 8 keys into shared: V8[8 x TILE_DV]
+            // Compute scores s_j for this row i against this tile
+            float s_local[BC];  // uses compile-time bound
             #pragma unroll
-            for (int ii = tid; ii < MICRO_N * TILE_DV; ii += block_size) {
-                int j8 = ii / TILE_DV;            // 0..7
-                int dv = ii % TILE_DV;            // 0..TILE_DV-1
-                int gk = n_start + owner * MICRO_N + j8; // global key index
-                int gdv = dv_start + dv;                 // global dv column
-                float v = 0.f;
-                if (gk < (int)N_size && gdv < (int)DV_size) {
-                    size_t vidx = (size_t)gk * ldv + gdv + V_offset;
-                    v = V[vidx];
-                }
-                V8[j8][dv] = v;
+            for (int j = 0; j < n_lim; ++j) {
+                const float* q_row = &Qs[tx][0];
+                const float* k_row = &Ks[j][0];
+                float dot = 0.f;
+                // FMAs over D (optionally vectorize with float4 when D%4==0)
+                for (int d = 0; d < D; ++d) 
+                dot = fmaf(q_row[d], k_row[d], dot);
+                s_local[j] = dot * scale;
             }
-            __syncthreads();
 
-            // Ō += E8 · V8  (K=8 micro-GEMM)
+            // Online softmax update
+            float m_tile = -INFINITY;
             #pragma unroll
-            for (int i = 0; i < MICRO_M; ++i) {
-                int r = threadIdx.y * MICRO_M + i;
+            for (int j = 0; j < n_lim; ++j) m_tile = fmaxf(m_tile, s_local[j]);
+            const float m_new = fmaxf(m_row, m_tile);
+
+            float sum_exp = 0.f;
+            const float carry = (l_row > 0.f) ? (l_row * expf(m_row - m_new)) : 0.f;
+
+            float p_local[BC];
+            #pragma unroll
+            for (int j = 0; j < n_lim; ++j) {
+                float p = expf(s_local[j] - m_new);
+                p_local[j] = p;
+                sum_exp += p;
+            }
+
+            const float l_new     = carry + sum_exp;
+            const float inv_l_new = 1.f / l_new;
+            const float alpha     = (l_row > 0.f) ? (carry * inv_l_new) : 0.f;
+
+            // o = o*alpha + Σ_j (p_local[j]*inv_l_new) * v_j
+            #pragma unroll
+            for (int t = 0; t < dv_lim; ++t) o_chunk[t] *= alpha;
+
+            #pragma unroll
+            for (int j = 0; j < n_lim; ++j) {
+                const float beta = p_local[j] * inv_l_new;
+                const float* v_row = &Vs[j][0];
                 #pragma unroll
-                for (int j = 0; j < MICRO_N; ++j) {   // per-thread dv micro-columns
-                    int dv_local = j;                 // 0..7
-                    int dv_col   = threadIdx.x * MICRO_N + dv_local; // 0..TILE_DV-1
-                    if (dv_start + dv_col < (int)DV_size) {
-                        float acc = O_reg[i][dv_local];
-                        #pragma unroll
-                        for (int k8 = 0; k8 < MICRO_N; ++k8) {
-                            acc = fmaf(E8[r][k8], V8[k8][dv_col], acc);
-                        }
-                        O_reg[i][dv_local] = acc;
-                    }
+                for (int t = 0; t < dv_lim; ++t) {
+                    o_chunk[t] = fmaf(beta, v_row[t], o_chunk[t]);
                 }
             }
-            __syncthreads();
-        } // end stripes
 
-        // ---- Reduce row sums across BX and update (l, m)
-        if (threadIdx.x == 0) {
-            #pragma unroll
-            for (int g = 0; g < MICRO_M; ++g) {
-                int r = threadIdx.y * MICRO_M + g;
-                float tsum = 0.f;
-                #pragma unroll
-                for (int c = 0; c < BX; ++c) tsum += tile_row_sum[r][c];
-                float old_m = row_m[r];
-                float new_m = new_m_local[g];
-                row_l[r] = row_l[r] * __expf(old_m - new_m) + tsum;
-                row_m[r] = new_m;
-            }
-        }
-        __syncthreads();
-    }
+            // commit stats for next tile
+            m_row = m_new;
+            l_row = l_new;
 
-    // ---- finalize: divide by l and store O tile
-    #pragma unroll
-    for (int i = 0; i < MICRO_M; ++i) {
-        int gm = blockIdx.y * TILE_M + threadIdx.y * MICRO_M + i;  // global row
-        if (gm >= (int)M_size) continue;
-        float denom = row_l[threadIdx.y * MICRO_M + i];
+            __syncthreads(); // protect Ks/Vs before next tile load
+        } // tiles on N
+
+        // Store output chunk for row i
+        float* o_dst = O + Ob_offset + (int64_t)i * DV + dv0;
         #pragma unroll
-        for (int j = 0; j < MICRO_N; ++j) {
-            int dv_col = threadIdx.x * MICRO_N + j;
-            int gdv    = dv_start + dv_col;
-            if (gdv < (int)DV_size) {
-                size_t oidx = (size_t)gm * ldo + gdv + O_offset;
-                O[oidx] = (scalar_t)(O_reg[i][j] / denom);
-            }
-        }
-    }
+        for (int t = 0; t < dv_lim; ++t) 
+            o_dst[t] = o_chunk[t];
+    } // chunks over DV
 }
 
-void print_shape(torch::Tensor ten) {
-    for(int i = 0; i < 3; i++) 
-        std::cout << ten.size(i) << " ";
-    std::cout << std::endl;
-}
+// -------------------- TORCH WRAPPER --------------------
 
-torch::Tensor flash_attention_forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V, float scale) {
-    std::cout << "invoke flash attention\n";
-    TORCH_CHECK(Q.is_cuda(), "inputs must be on cuda");
-    TORCH_CHECK(Q.dtype() == torch::kFloat32, "inputs must be fp32");
-    TORCH_CHECK(K.is_cuda(), "inputs must be on cuda");
-    TORCH_CHECK(K.dtype() == torch::kFloat32, "inputs must be fp32");
+torch::Tensor flash_attention_forward(torch::Tensor Q,
+                                      torch::Tensor K,
+                                      torch::Tensor V,
+                                      float scale) {
+    TORCH_CHECK(Q.is_cuda() && K.is_cuda() && V.is_cuda(), "Q,K,V must be CUDA");
+    TORCH_CHECK(Q.dtype() == torch::kFloat32 &&
+                K.dtype() == torch::kFloat32 &&
+                V.dtype() == torch::kFloat32, "Only fp32 supported");
+    TORCH_CHECK(Q.dim()==3 && K.dim()==3 && V.dim()==3,
+                "Expected Q:[B,M,D], K:[B,N,D], V:[B,N,DV]");
 
-    const int64_t batch_size = Q.size(0);
-    const int64_t m_size = Q.size(1);
-    const int64_t k_size = Q.size(2);
-    const int64_t n_size = K.size(1); // transpose fusion change
-    const int64_t dv_size = V.size(2);
+    const int B  = (int)Q.size(0);
+    const int M  = (int)Q.size(1);
+    const int D  = (int)Q.size(2);
+    const int N  = (int)K.size(1);
+    TORCH_CHECK(K.size(0)==B && K.size(2)==D, "K shape mismatch with Q");
+    TORCH_CHECK(V.size(0)==B && V.size(1)==N, "V shape mismatch with K");
+    const int DV = (int)V.size(2);
 
-    auto opts = Q.options();
-    torch::Tensor out = torch::empty({batch_size, m_size, dv_size}, opts);
+    // Guard for static shared arrays
+    TORCH_CHECK(D <= D_MAX,
+        "D=", D, " exceeds D_MAX=", D_MAX, ". Recompile with larger D_MAX or lower D.");
 
-    dim3 block_size(BX, BY, 1);
-    dim3 grid_size((dv_size - 1) / TILE_DV + 1, 
-                   (m_size - 1) / TILE_M + 1, // ????????????????///
-                   batch_size);
+    auto O = torch::empty({B, M, DV}, Q.options());
 
-    #ifdef TIME_FLOPS
+    dim3 block(BR, 1, 1);               // thread-per-row within CTA slab
+    dim3 grid(1, (M + BR - 1) / BR, B); // y-tiles over M, z over B
+
+#ifdef TIME_FLOPS
     auto stream = at::cuda::getCurrentCUDAStream();
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
+    cudaEvent_t start, stop; cudaEventCreate(&start); cudaEventCreate(&stop);
     cudaEventRecord(start, stream.stream());
-    #endif
+#endif
 
-    flash_attention_kernel<float><<<grid_size, block_size>>>(
-        Q.data_ptr<float>(),
-        K.data_ptr<float>(),
-        V.data_ptr<float>(),
-        out.data_ptr<float>(),
-        batch_size,
-        m_size,
-        n_size,
-        k_size, 
-        dv_size,
-        scale
+    flash_attention_kernel_fp32_static<<<grid, block>>>(
+        Q.data_ptr<float>(), K.data_ptr<float>(), V.data_ptr<float>(),
+        O.data_ptr<float>(), B, M, N, D, DV, scale
     );
 
-    #ifdef TIME_FLOPS
+#ifdef TIME_FLOPS
     cudaEventRecord(stop, stream.stream());
     cudaEventSynchronize(stop);
-    float elapsed_time_ms;
-    cudaEventElapsedTime(&elapsed_time_ms, start, stop);
-    double sec_per_call = elapsed_time_ms/1e3;
-    double flops_qk = 2.0 * static_cast<double>(batch_size) * static_cast<double>(m_size) * static_cast<double>(k_size) * static_cast<double>(n_size);
-    double flops_pv = 2.0 * static_cast<double>(batch_size) * static_cast<double>(m_size) * static_cast<double>(n_size) * static_cast<double>(dv_size);
-    double flops_per_call = flops_qk + flops_pv;
-    std::cout << "flash attention sizes: [" << m_size << "x" << k_size << "] * [" << k_size << "x" << n_size << "]" << std::endl;
-    std::cout << "flash attention perf: " << flops_per_call / (sec_per_call*1e12) << " TFLOP/s" << std::endl;
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-    #endif
-    
-    return out;
+    float elapsed_ms = 0.f; cudaEventElapsedTime(&elapsed_ms, start, stop);
+    cudaEventDestroy(start); cudaEventDestroy(stop);
+    const double sec = elapsed_ms * 1e-3;
+    const double flops_qk = 2.0 * (double)B * (double)M * (double)D * (double)N;
+    const double flops_pv = 2.0 * (double)B * (double)M * (double)N * (double)DV;
+    const double tflops   = (flops_qk + flops_pv) / (sec * 1e12);
+    std::cout << "flash attention sizes: Q[" << B << "," << M << "," << D
+              << "], K[" << B << "," << N << "," << D
+              << "], V[" << B << "," << N << "," << DV << "]\n";
+    std::cout << "flash attention perf: " << tflops << " TFLOP/s\n";
+#endif
+
+    return O;
 }

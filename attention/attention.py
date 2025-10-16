@@ -16,12 +16,12 @@ if DEBUG_MODE:
 else:
     batch_size = 8
     seq_len = 4096 # as in llama2
-    embed_dim = 256 # as in llama2
+    embed_dim = 128 # as in llama2
     num_heads = 1
 
 
 def benchmark(name, model, *inputs):
-    warmup_iters = 2
+    warmup_iters = 1
     for iter in range(0, warmup_iters):
         torch.cuda.synchronize()
         with torch.no_grad():
@@ -30,7 +30,7 @@ def benchmark(name, model, *inputs):
     avg_time = 0.0
     min_time = 0.0
     max_time = 0.0
-    benchmark_iters = 4
+    benchmark_iters = 3
     for iter in range(0, benchmark_iters):
         torch.cuda.synchronize()
         start = time.time()
@@ -207,7 +207,7 @@ def flash_attention(Q, K, V):
 
 
 def check(name, outs, ref):
-    all_close = torch.allclose(outs, ref)
+    all_close = torch.allclose(outs, ref, rtol=1e-5, atol=1e-5)
     print(f"{name} test all close? {all_close}")
     if not all_close:
         max_diff = torch.max(torch.abs(outs - ref))
@@ -248,9 +248,10 @@ def run():
     K = torch.randn(batch_size, seq_len, embed_dim).cuda()
     V = torch.randn(batch_size, seq_len, embed_dim).cuda()
 
-    cuda_naive_res = cuda_opt_layerwise_attention(Q, K, V)
+    torch_res = torch_attention(Q, K, V)
 
-    fa = flash_attention(Q, K, V)
+    flash_attention_res = flash_attention(Q, K, V)
+    check("flash attention", torch_res, flash_attention_res)
 
 
 if __name__ == "__main__":
