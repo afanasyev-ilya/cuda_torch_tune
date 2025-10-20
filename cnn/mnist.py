@@ -14,14 +14,18 @@ class CNNbyGPT(nn.Module):
     def __init__(self, num_classes=10):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(1, 32, 3, padding=1), nn.ReLU(inplace=True),
-            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),                  # 14x14
-            nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),                  # 7x7
-            nn.Flatten(),
-            nn.Linear(128*7*7, 256), nn.ReLU(inplace=True),
-            nn.Linear(256, num_classes),
+            # input is [B, 1, 28, 28]
+            nn.Conv2d(1, 32, 3, padding=1), # -> [B, 32, 28, 28], since in channels = 1, out channles = 32
+            nn.ReLU(inplace=True), # eltwise same shape
+            nn.Conv2d(32, 64, 3, padding=1), # -> [B, 64, 28, 28], since in channels = 32, out channles = 64
+            nn.ReLU(inplace=True), # eltwise same shape
+            nn.MaxPool2d(2), # -> [B, 64, 14, 14], 
+            nn.Conv2d(64, 128, 3, padding=1), # -> [B, 128, 14, 14]
+            nn.ReLU(inplace=True), # eltwise same shape
+            nn.MaxPool2d(2),  # -> [B, 128, 7, 7]
+            nn.Flatten(), # -> [B, 128*7*7]
+            nn.Linear(128*7*7, 256), nn.ReLU(inplace=True), # [B, 256]
+            nn.Linear(256, num_classes), # [B, 1]
         )
 
     def forward(self, x): return self.net(x)
@@ -34,7 +38,8 @@ class FullyConnectedCNN(nn.Module):
         self.net = nn.Sequential(
             nn.Flatten(), # used to convert nchv -> n, chw
             nn.Linear(28*28, self.hidden),
-            nn.ReLU(), # relu is eltwise x -> max(0, x), e.g. errases negative values. used here to prevent collapsed linear.
+            #nn.ReLU(), # relu is eltwise x -> max(0, x), e.g. errases negative values. used here to prevent collapsed linear.
+            nn.SiLU(),
             # collapsed linear means y1 = w1*x+b1, y2 = (y1)*x+b2 = (w1*x + b1)*w1 + b2 = (w1*w1)*x + (b2 + w1*b1) 
             nn.Linear(self.hidden, num_classes),
         )
