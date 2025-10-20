@@ -78,6 +78,107 @@ class MLPBasedNN(nn.Module):
     def forward(self, x): 
         return self.net(x)
 
+
+# -------- ResNet-style bottleneck block (as in ResNet-50) --------
+class Bottleneck(nn.Module):
+    expansion = 4  # output channels = planes * expansion
+
+    def __init__(self, in_planes, planes, stride=1):
+        super().__init__()
+        # 1x1 reduce
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=1, bias=False)
+        self.bn1   = nn.BatchNorm2d(planes)
+        # 3x3 spatial
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride,
+                               padding=1, bias=False)
+        self.bn2   = nn.BatchNorm2d(planes)
+        # 1x1 expand
+        out_planes = planes * self.expansion
+        self.conv3 = nn.Conv2d(planes, out_planes, kernel_size=1, bias=False)
+        self.bn3   = nn.BatchNorm2d(out_planes)
+
+        # projection for the skip path if shape/stride changes
+        self.downsample = None
+        if stride != 1 or in_planes != out_planes:
+            self.downsample = nn.Sequential(
+                nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_planes),
+            )
+
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        identity = x
+
+        out = self.relu(self.bn1(self.conv1(x)))      # [B, planes,    H,   W]
+        out = self.relu(self.bn2(self.conv2(out)))    # [B, planes,  H/s, W/s]
+        out = self.bn3(self.conv3(out))               # [B, planes*4, H/s, W/s]
+
+        if self.downsample is not None:
+            identity = self.downsample(identity)      # match shape
+
+        out += identity                                # residual add
+        out = self.relu(out)
+        return out
+
+
+# -------- AdvancedCNN (ResNet-50-ish layout) --------
+class AdvancedCNN(nn.Module):
+    """
+    ResNet-50 style:
+      stem:   7x7 s=2 -> BN -> ReLU -> 3x3 maxpool s=2
+      stages: [3, 4, 6, 3] bottleneck blocks with channel widths [64, 128, 256, 512]
+      head:   global avg pool -> linear
+    Input expected: [B, 3, 224, 224]  (ResNet family)
+    """
+    def __init__(self, num_classes=10):
+        super().__init__()
+
+        # ----- Stem -----
+        # [B,3,224,224] -> [B,64,112,112] -> [B,64,56,56]
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),  # [B,64,112,112]
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)                   # [B,64,56,56]
+        )
+
+        # ----- Stages (ResNet-50: 3,4,6,3 bottlenecks) -----
+        self.layer1 = self._make_layer( in_planes=64,   planes=64,  blocks=3, stride=1)  # -> [B,256,56,56]
+        self.layer2 = self._make_layer( in_planes=256,  planes=128, blocks=4, stride=2)  # -> [B,512,28,28]
+        self.layer3 = self._make_layer( in_planes=512,  planes=256, blocks=6, stride=2)  # -> [B,1024,14,14]
+        self.layer4 = self._make_layer( in_planes=1024, planes=512, blocks=3, stride=2)  # -> [B,2048,7,7]
+
+        # ----- Head -----
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))  # [B,2048,1,1]
+        self.fc = nn.Linear(2048, num_classes)       # [B,num_classes]
+
+        # init (good defaults)
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight); nn.init.zeros_(m.bias)
+
+    def _make_layer(self, in_planes, planes, blocks, stride):
+        layers = [Bottleneck(in_planes, planes, stride=stride)]
+        out_planes = planes * Bottleneck.expansion
+        for _ in range(1, blocks):
+            layers.append(Bottleneck(out_planes, planes, stride=1))
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        # [B,3,224,224]
+        x = self.stem(x)             # [B,64,56,56]
+        x = self.layer1(x)           # [B,256,56,56]
+        x = self.layer2(x)           # [B,512,28,28]
+        x = self.layer3(x)           # [B,1024,14,14]
+        x = self.layer4(x)           # [B,2048,7,7]
+        x = self.avgpool(x)          # [B,2048,1,1]
+        x = torch.flatten(x, 1)      # [B,2048]
+        x = self.fc(x)               # [B,num_classes]
+        return x
+
 # -------------- data --------------
 def get_loaders(bs=128, num_workers=4):
     """
