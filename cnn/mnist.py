@@ -28,6 +28,12 @@ class CNNbyGPT(nn.Module):
             nn.Linear(256, num_classes), # [B, 1]
         )
 
+        x = torch.randn(4, 1, 28, 28)
+        for i, layer in enumerate(self.net):
+            x_old = x
+            x = layer(x)
+            print(f"{layer.__class__.__name__} {x_old.shape} -> {x.shape}")
+
     def forward(self, x): return self.net(x)
 
 class FullyConnectedCNN(nn.Module):
@@ -75,7 +81,7 @@ def train(epochs=3, lr=2e-3, bs=256):
     set_seed(0)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_loader, test_loader = get_loaders(bs=bs)
-    model = FullyConnectedCNN().to(device)
+    model = CNNbyGPT().to(device)
 
     model = torch.compile(model)  # PyTorch 2.x; remove if unavailable
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
