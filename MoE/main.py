@@ -3,6 +3,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import time
+import os
+
 
 # --- Model Definitions ---
 class TinyGPT(nn.Module):
@@ -216,6 +218,7 @@ class MoE(nn.Module):
             idx = torch.cat([idx, next_id], dim=1)
         return idx
 
+
 class MoEFFN(nn.Module):
     def __init__(self, n_embd, num_experts, topk):
         super(MoEFFN, self).__init__()
@@ -237,16 +240,16 @@ class MoEFFN(nn.Module):
         
         return out
 
+
 # --- Main Training and Inference Script ---
-def load_data(file_path, block_size=128):
-    with open(file_path, 'r') as f:
-        text = f.read()
-    # Basic tokenization by character
-    vocab = sorted(set(text))
-    stoi = {ch: i for i, ch in enumerate(vocab)}
-    itos = {i: ch for i, ch in enumerate(vocab)}
-    data = [stoi[c] for c in text]
-    return data, stoi, itos
+def load_text(path: str) -> str:
+    if path and os.path.exists(path):
+        with open(path, 'r', encoding='utf-8') as f:
+            return f.read()
+    else:
+        print("No dataset found")
+        exit(1)
+
 
 def get_batch(data, batch_size, block_size):
     # Non-naive batching: efficient handling
@@ -255,60 +258,107 @@ def get_batch(data, batch_size, block_size):
     y = torch.stack([torch.tensor(data[i + 1:i + 1 + block_size]) for i in ix])
     return x, y
 
-def train(model, data, batch_size=64, block_size=128, epochs=3, lr=3e-4):
+
+def get_batch(data_ids, block_size, batch_size, device):
+    # sample random offsets
+    ix = torch.randint(0, data_ids.size(0) - block_size - 1, (batch_size,))
+    x = torch.stack([data_ids[i:i+block_size] for i in ix])
+    y = torch.stack([data_ids[i+1:i+1+block_size] for i in ix])
+    return x.to(device), y.to(device)
+
+
+def print_model_info(model):
+    # Print model parameter count and estimated size
+    param_count = sum(p.numel() for p in model.parameters())
+    estimated_size = param_count * 4 / (1024 ** 2)  # size in MB assuming float32 (4 bytes)
+    print(f"Model has {param_count:,} parameters.")
+    print(f"Estimated model size: {estimated_size:.2f} MB")
+
+
+def train(model, data_ids, batch_size=64, block_size=128, epochs=3, lr=3e-4):
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     loss_fn = nn.CrossEntropyLoss()
     
     model.train()
-    start_time = time.time()
-
+    t0 = time.time()
     for epoch in range(epochs):
-        for i in range(0, len(data), batch_size):
-            x_batch, y_batch = get_batch(data, batch_size, block_size)
-            x_batch = x_batch.cuda()  # Move batch to GPU
-            y_batch = y_batch.cuda()  # Move batch to GPU
+        x_batch, y_batch = get_batch(data_ids, batch_size, block_size, 'cuda')
 
-            optimizer.zero_grad()
-            logits = model(x_batch)
-            loss = loss_fn(logits.view(-1, logits.size(-1)), y_batch.view(-1))
-            loss.backward()
-            optimizer.step()
+        optimizer.zero_grad()
+        logits = model(x_batch)
+        loss = loss_fn(logits.view(-1, logits.size(-1)), y_batch.view(-1))
+        loss.backward()
+        optimizer.step()   
 
-        print(f"Epoch {epoch+1}/{epochs} | Loss: {loss.item()}")
+        if epoch % max(1, epochs // 10) == 0 or epoch == (epochs - 1):
+            dt = time.time() - t0
+            print(f"epoch {epoch:5d}/{epochs} | loss {loss.item():.4f} | {dt:.1f}s")
 
-    training_time = time.time() - start_time
+    training_time = time.time() - t0
     print(f"Training time: {training_time:.2f} seconds")
 
-def inference(model, prompt, stoi, itos, max_new_tokens=100):
+
+class CharTokenizer:
+    def __init__(self, text: str):
+        vocab = sorted(set(text))
+        self.stoi = {ch: i for i, ch in enumerate(vocab)}
+        self.itos = {i: ch for i, ch in enumerate(vocab)}
+        self.vocab_size = len(vocab)
+
+    def encode(self, s: str):
+        return [self.stoi[c] for c in s]
+
+    def decode(self, ids):
+        return ''.join(self.itos[i] for i in ids)
+
+
+def inference(model, tok, max_new_tokens=100):
     model.eval()
-    idx = torch.tensor([stoi[c] for c in prompt]).unsqueeze(0).cuda()  # Move to GPU
-    generated = model.generate(idx, max_new_tokens)
-    return ''.join([itos[i.item()] for i in generated[0]])
+
+    # prepare empty context for now
+    ctx = torch.zeros((1, 1), dtype=torch.long).to('cuda')
+
+    # infer
+    out = model.generate(ctx, max_new_tokens)[0].tolist()
+    print(out)
+    generated = tok.decode(out)
+
+    return generated
+
 
 # --- Main ---
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, choices=["tinyGPT", "MoE_MHA", "MoE"], required=True)
-    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--epochs", type=int, default=2000)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--max_new_tokens", type=int, default=100)
     args = parser.parse_args()
+
+    # Load data
+    text = load_text("./input.txt")
+    # print(text[0:100])
+
+    # tokenize data
+    tok = CharTokenizer(text)
+    data_ids = torch.tensor(tok.encode(text), dtype=torch.long)
 
     # Load model
     if args.model == "tinyGPT":
-        model = TinyGPT(vocab_size=256, n_embd=128, n_layer=4, n_head=4, block_size=128).cuda()
+        model = TinyGPT(vocab_size=tok.vocab_size, n_embd=128, n_layer=4, n_head=4, block_size=128).cuda()
     elif args.model == "MoE_MHA":
-        model = MoE_MHA(vocab_size=256, n_embd=128, n_layer=4, n_head=4, block_size=128, num_experts=4, topk=1).cuda()
+        model = MoE_MHA(vocab_size=tok.vocab_size, n_embd=128, n_layer=4, n_head=4, block_size=128, num_experts=4, topk=1).cuda()
     elif args.model == "MoE":
-        model = MoE(vocab_size=256, n_embd=128, n_layer=4, num_experts=4).cuda()
+        model = MoE(vocab_size=tok.vocab_size, n_embd=128, n_layer=4, num_experts=4).cuda()
 
-    # Load data
-    data, stoi, itos = load_data("./input.txt")
+    # Print model info
+    print_model_info(model)
 
     # Train the model
-    train(model, data, batch_size=args.batch_size, epochs=args.epochs, lr=args.lr)
+    train(model, data_ids, batch_size=args.batch_size, epochs=args.epochs, lr=args.lr)
 
     # Generate text with the trained model
-    prompt = "What is the capital of France?"
-    output = inference(model, prompt, stoi, itos)
+    output = inference(model, tok, max_new_tokens=args.max_new_tokens)
     print("Generated text:", output)
+
