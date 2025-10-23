@@ -7,6 +7,8 @@ import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+########################################################################################################
+
 # MHA model and it's config
 @dataclass
 class MiniGPTConfig:
@@ -92,7 +94,7 @@ class MiniGPT(nn.Module):
         self.drop = nn.Dropout(config.dropout)
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
         self.ln_f = nn.LayerNorm(config.n_embd)
-        self.head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.fc = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
@@ -103,8 +105,10 @@ class MiniGPT(nn.Module):
         for block in self.blocks:
             x, aux = block(x)
             aux_total = aux_total + aux
+
         x = self.ln_f(x)
-        logits = self.head(x)
+        logits = self.fc(x)
+
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
@@ -121,6 +125,113 @@ class MiniGPT(nn.Module):
             idx = torch.cat([idx, next_id], dim=1)
         return idx
 
+########################################################################################################
+
+@dataclass
+class MoEGPTConfig(MiniGPTConfig):
+    vocab_size: int
+    n_layer: int = 4
+    n_head: int = 8
+    n_embd: int = 256
+    block_size: int = 128
+    dropout: float = 0.1
+
+    aux_loss_weight: float = 0.01
+
+    num_experts: int = 8  # Number of experts
+    expert_dim: int = 256  # Hidden dimension of experts
+    top_k_experts: int = 2  # Number of experts to use for each token
+
+
+class Router(nn.Module):
+    def __init__(self, config: MoEGPTConfig):
+        super().__init__()
+        self.fc = nn.Linear(config.n_embd, config.num_experts)  # Output size = num_experts
+
+    def forward(self, x):
+        # (B, T, C) -> (B, T, num_experts)
+        logits = self.fc(x)  # Raw logits to determine routing for each token
+        probs = F.softmax(logits, dim=-1)  # (B, T, num_experts)
+        return probs
+
+class MoEExpert(nn.Module):
+    def __init__(self, config: MoEGPTConfig):
+        super().__init__()
+        self.expert_fc = nn.Sequential(
+            nn.Linear(config.n_embd, config.expert_dim),
+            nn.GELU(),
+            nn.Linear(config.expert_dim, config.n_embd),
+        )
+
+    def forward(self, x):
+        return self.expert_fc(x)
+
+class MoELayer(nn.Module):
+    def __init__(self, config: MoEGPTConfig):
+        super().__init__()
+        self.router = Router(config)
+        self.experts = nn.ModuleList([MoEExpert(config) for _ in range(config.num_experts)])
+
+    def forward(self, x):
+        B, T, C = x.shape
+        expert_probs = self.router(x)  # (B, T, num_experts)
+        expert_outputs = []
+
+        # Use softmax probabilities to apply weighted expert outputs
+        for i, expert in enumerate(self.experts):
+            expert_output = expert(x)  # (B, T, C)
+            expert_outputs.append(expert_output * expert_probs[:, :, i:i+1])  # Weighted by probability
+
+        # Aggregate the expert outputs (sum the weighted outputs)
+        moe_output = torch.stack(expert_outputs, dim=-1).sum(dim=-1)  # (B, T, C)
+        return moe_output
+
+class MoEGPT(nn.Module):
+    def __init__(self, config: MoEGPTConfig):
+        super().__init__()
+        self.config = config
+        self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd)
+        self.pos_emb = nn.Embedding(config.block_size, config.n_embd)
+        self.drop = nn.Dropout(config.dropout)
+
+        self.mha_blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer - 1)])
+        self.moe_layer = MoELayer(config)
+        self.ln_f = nn.LayerNorm(config.n_embd)  # Final layer norm
+        self.head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+    def forward(self, idx, targets=None):
+        B, T = idx.shape
+        pos = torch.arange(0, T, device=idx.device).unsqueeze(0)
+        x = self.tok_emb(idx) + self.pos_emb(pos)
+        x = self.drop(x)
+        aux_total = x.new_zeros(())
+        
+        for mha_block in self.mha_blocks:
+            x, aux = mha_block(x)
+            aux_total = aux_total + aux
+        
+        x = self.moe_layer(x)  # Apply MoE layer
+        x = self.ln_f(x)
+        logits = self.head(x)
+        
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        
+        return logits, loss, aux_total
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens: int):
+        for _ in range(max_new_tokens):
+            idx_cond = idx[:, -self.config.block_size:]
+            logits, _, _ = self.forward(idx_cond)
+            logits = logits[:, -1, :]
+            probs = F.softmax(logits, dim=-1)
+            next_id = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat([idx, next_id], dim=1)
+        return idx
+
+########################################################################################################
 
 # --- Main Training and Inference Script ---
 def load_text(path: str) -> str:
@@ -175,7 +286,6 @@ def train(model, data_ids, batch_size=64, block_size=128, epochs=3, lr=3e-4):
         if epoch % max(1, epochs // 10) == 0 or epoch == 1:
             dt = time.time() - t0
             print(f"epoch {epoch:5d}/{epochs} | loss {loss.item():.4f} (ce {loss_ce.item():.4f} + aux {aux_loss.item():.4f}) | {dt:.1f}s")
-            t0 = time.time()
 
     training_time = time.time() - t0
     print(f"Training time: {training_time:.2f} seconds")
@@ -203,7 +313,6 @@ def inference(model, tok, max_new_tokens=100):
 
     # infer
     out = model.generate(ctx, max_new_tokens)[0].tolist()
-    print(out)
     generated = tok.decode(out)
 
     return generated
@@ -212,7 +321,7 @@ def inference(model, tok, max_new_tokens=100):
 # --- Main ---
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, choices=["tinyGPT", "MoE_MHA", "MoE"], required=True)
+    parser.add_argument("--model", type=str, choices=["miniGPT", "MoE"], required=True)
     parser.add_argument("--epochs", type=int, default=2000)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -221,20 +330,20 @@ if __name__ == "__main__":
 
     # Load data
     text = load_text("./input.txt")
-    # print(text[0:100])
 
     # tokenize data
     tok = CharTokenizer(text)
     data_ids = torch.tensor(tok.encode(text), dtype=torch.long)
 
     # Load model
-    if args.model == "tinyGPT":
+    if args.model == "miniGPT":
+        print("miniGPT")
         cfg = MiniGPTConfig(vocab_size=tok.vocab_size)
         model = MiniGPT(cfg).cuda()
-    elif args.model == "MoE_MHA":
-        # TODO
-        print("Not done yet")
-        exit(1)
+    elif args.model == "MoE":
+        print("using MoE model")
+        cfg = MoEGPTConfig(vocab_size=tok.vocab_size)
+        model = MoEGPT(cfg).cuda()
 
     # Print model info
     print_model_info(model)
