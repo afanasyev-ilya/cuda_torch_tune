@@ -4,241 +4,122 @@ import torch.nn as nn
 import torch.nn.functional as F
 import time
 import os
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
 
-# --- Model Definitions ---
-class TinyGPT(nn.Module):
-    def __init__(self, vocab_size, n_embd, n_layer, n_head, block_size, dropout=0.1):
-        super(TinyGPT, self).__init__()
+@dataclass
+class MiniGPTConfig:
+    vocab_size: int
+    n_layer: int = 4
+    n_head: int = 4
+    n_embd: int = 128
+    block_size: int = 128
+    dropout: float = 0.0
 
-        self.vocab_size = vocab_size
-        self.n_embd = n_embd
-        self.n_layer = n_layer
-        self.n_head = n_head
-        self.block_size = block_size
+    aux_loss_weight: float = 0.01
 
-        # Token and position embeddings
-        self.tok_emb = nn.Embedding(vocab_size, n_embd)
-        self.pos_emb = nn.Embedding(block_size, n_embd)
-        self.drop = nn.Dropout(dropout)
 
-        # Transformer blocks (MHA layers)
-        self.blocks = nn.ModuleList([self._build_block() for _ in range(n_layer)])
+class MHA(nn.Module):
+    def __init__(self, config: MiniGPTConfig):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        self.n_head = config.n_head
+        self.head_dim = config.n_embd // config.n_head
+        self.scale = self.head_dim ** -0.5
 
-        # Output layer
-        self.ln_f = nn.LayerNorm(n_embd)
-        self.head = nn.Linear(n_embd, vocab_size, bias=False)
-        
-    def _build_block(self):
-        """Builds a single transformer block with MHA and a feed-forward layer"""
-        return nn.ModuleList([
-            nn.LayerNorm(self.n_embd),
-            nn.MultiheadAttention(self.n_embd, self.n_head),
-            nn.LayerNorm(self.n_embd),
-            nn.Linear(self.n_embd, 4 * self.n_embd),
+        self.qkv = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
+        self.proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.dropout = nn.Dropout(config.dropout)
+
+        # causal mask prepared once for maximum block size
+        self.register_buffer(
+            'mask',
+            torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size)
+        )
+
+    def forward(self, x):
+        B, T, C = x.shape
+        qkv = self.qkv(x)  # (B, T, 3C)
+        q, k, v = qkv.chunk(3, dim=-1)
+        # shape into heads
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, nh, T, hd)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+
+        att = (q @ k.transpose(-2, -1)) * self.scale  # (B, nh, T, T)
+        att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float('-inf'))
+        att = F.softmax(att, dim=-1)
+        att = self.dropout(att)
+        y = att @ v  # (B, nh, T, hd)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.proj(y)
+        y = self.dropout(y)
+        return y
+
+class DenseFFN(nn.Module):
+    def __init__(self, n_embd: int, dropout: float = 0.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd),
             nn.GELU(),
-            nn.Linear(4 * self.n_embd, self.n_embd),
-            nn.Dropout(0.1)
-        ])
-    
+            nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(dropout),
+        )
+
     def forward(self, x):
-        B, T = x.size()
+        return self.net(x)
 
-        # Embedding lookup
-        pos = torch.arange(0, T, device=x.device).unsqueeze(0)
-        x = self.tok_emb(x) + self.pos_emb(pos)
+class Block(nn.Module):
+    def __init__(self, config: MiniGPTConfig):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(config.n_embd)
+        self.ln2 = nn.LayerNorm(config.n_embd)
+        self.attn = MHA(config)
+        self.ff = DenseFFN(config.n_embd, config.dropout)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln1(x))
+        x = x + self.ff(self.ln2(x))
+        return x, x.new_zeros(())  # zero aux
+
+class MiniGPT(nn.Module):
+    def __init__(self, config: MiniGPTConfig):
+        super().__init__()
+        self.config = config
+        self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd)
+        self.pos_emb = nn.Embedding(config.block_size, config.n_embd)
+        self.drop = nn.Dropout(config.dropout)
+        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
+        self.ln_f = nn.LayerNorm(config.n_embd)
+        self.head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+    def forward(self, idx, targets=None):
+        B, T = idx.shape
+        pos = torch.arange(0, T, device=idx.device).unsqueeze(0)
+        x = self.tok_emb(idx) + self.pos_emb(pos)
         x = self.drop(x)
-
-        # Forward through transformer blocks
+        aux_total = x.new_zeros(())
         for block in self.blocks:
-            x = self._forward_block(x, block)
-
-        # Final layer normalization and output
+            x, aux = block(x)
+            aux_total = aux_total + aux
         x = self.ln_f(x)
         logits = self.head(x)
-        return logits
-    
-    def _forward_block(self, x, block):
-        ln1, mha, ln2, ff1, act, ff2, drop = block
-        # Self-attention
-        x_res = x
-        x = ln1(x)
-        attn_out, _ = mha(x, x, x)
-        x = x_res + attn_out
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss, aux_total
 
-        # Feed-forward
-        x_res = x
-        x = ln2(x)
-        x = ff2(act(ff1(x)))
-        x = x_res + drop(x)
-        
-        return x
-
-    def generate(self, idx, max_new_tokens):
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens: int):
         for _ in range(max_new_tokens):
-            idx_cond = idx[:, -self.block_size:]
-            logits = self.forward(idx_cond)
+            idx_cond = idx[:, -self.config.block_size:]
+            logits, _, _ = self.forward(idx_cond)
             logits = logits[:, -1, :]
             probs = F.softmax(logits, dim=-1)
             next_id = torch.multinomial(probs, num_samples=1)
             idx = torch.cat([idx, next_id], dim=1)
         return idx
-
-class MoE_MHA(nn.Module):
-    def __init__(self, vocab_size, n_embd, n_layer, n_head, block_size, num_experts, topk, dropout=0.1):
-        super(MoE_MHA, self).__init__()
-
-        self.vocab_size = vocab_size
-        self.n_embd = n_embd
-        self.n_layer = n_layer
-        self.n_head = n_head
-        self.block_size = block_size
-        self.num_experts = num_experts
-        self.topk = topk
-
-        # Token and position embeddings
-        self.tok_emb = nn.Embedding(vocab_size, n_embd)
-        self.pos_emb = nn.Embedding(block_size, n_embd)
-        self.drop = nn.Dropout(dropout)
-
-        # Transformer blocks (MHA + MoE)
-        self.blocks = nn.ModuleList([self._build_block() for _ in range(n_layer)])
-
-        # Output layer
-        self.ln_f = nn.LayerNorm(n_embd)
-        self.head = nn.Linear(n_embd, vocab_size, bias=False)
-        
-    def _build_block(self):
-        """Builds a single transformer block with MHA and MoE"""
-        return nn.ModuleList([
-            nn.LayerNorm(self.n_embd),
-            nn.MultiheadAttention(self.n_embd, self.n_head),
-            nn.LayerNorm(self.n_embd),
-            MoEFFN(self.n_embd, self.num_experts, self.topk),
-        ])
-    
-    def forward(self, x):
-        B, T = x.size()
-
-        # Embedding lookup
-        pos = torch.arange(0, T, device=x.device).unsqueeze(0)
-        x = self.tok_emb(x) + self.pos_emb(pos)
-        x = self.drop(x)
-
-        # Forward through transformer blocks
-        for block in self.blocks:
-            x = self._forward_block(x, block)
-
-        # Final layer normalization and output
-        x = self.ln_f(x)
-        logits = self.head(x)
-        return logits
-    
-    def _forward_block(self, x, block):
-        ln1, mha, ln2, moe = block
-        # Self-attention
-        x_res = x
-        x = ln1(x)
-        attn_out, _ = mha(x, x, x)
-        x = x_res + attn_out
-
-        # MoE (feed-forward)
-        x_res = x
-        x = ln2(x)
-        x = moe(x)
-        x = x_res + x
-        
-        return x
-
-    def generate(self, idx, max_new_tokens):
-        for _ in range(max_new_tokens):
-            idx_cond = idx[:, -self.block_size:]
-            logits = self.forward(idx_cond)
-            logits = logits[:, -1, :]
-            probs = F.softmax(logits, dim=-1)
-            next_id = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat([idx, next_id], dim=1)
-        return idx
-
-class MoE(nn.Module):
-    def __init__(self, vocab_size, n_embd, n_layer, num_experts, dropout=0.1):
-        super(MoE, self).__init__()
-
-        self.vocab_size = vocab_size
-        self.n_embd = n_embd
-        self.n_layer = n_layer
-        self.num_experts = num_experts
-
-        # Token and position embeddings
-        self.tok_emb = nn.Embedding(vocab_size, n_embd)
-        self.pos_emb = nn.Embedding(512, n_embd)  # Adjusted position embedding length
-        self.drop = nn.Dropout(dropout)
-
-        # MoE blocks (no attention)
-        self.blocks = nn.ModuleList([self._build_block() for _ in range(n_layer)])
-
-        # Output layer
-        self.ln_f = nn.LayerNorm(n_embd)
-        self.head = nn.Linear(n_embd, vocab_size, bias=False)
-
-    def _build_block(self):
-        """Builds a single MoE block (no attention)"""
-        return nn.ModuleList([
-            MoEFFN(self.n_embd, self.num_experts, 1),  # Just MoE (no attention)
-        ])
-    
-    def forward(self, x):
-        B, T = x.size()
-
-        # Embedding lookup
-        pos = torch.arange(0, T, device=x.device).unsqueeze(0)
-        x = self.tok_emb(x) + self.pos_emb(pos)
-        x = self.drop(x)
-
-        # Forward through MoE blocks
-        for block in self.blocks:
-            x = self._forward_block(x, block)
-
-        # Final layer normalization and output
-        x = self.ln_f(x)
-        logits = self.head(x)
-        return logits
-    
-    def _forward_block(self, x, block):
-        moe = block[0]
-        return moe(x)
-
-    def generate(self, idx, max_new_tokens):
-        for _ in range(max_new_tokens):
-            idx_cond = idx[:, -self.block_size:]
-            logits = self.forward(idx_cond)
-            logits = logits[:, -1, :]
-            probs = F.softmax(logits, dim=-1)
-            next_id = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat([idx, next_id], dim=1)
-        return idx
-
-
-class MoEFFN(nn.Module):
-    def __init__(self, n_embd, num_experts, topk):
-        super(MoEFFN, self).__init__()
-        self.num_experts = num_experts
-        self.topk = topk
-        self.experts = nn.ModuleList([nn.Linear(n_embd, n_embd) for _ in range(num_experts)])
-        self.router = nn.Linear(n_embd, num_experts)
-        
-    def forward(self, x):
-        B, T, C = x.size()
-        logits = self.router(x)
-        gates = F.softmax(logits, dim=-1)
-        
-        out = torch.zeros_like(x)
-        for e in range(self.num_experts):
-            sel = (gates[:, :, e] > 0.5).nonzero(as_tuple=False).squeeze(-1)
-            if sel.numel() > 0:
-                out.index_add_(0, sel, self.experts[e](x[sel]))
-        
-        return out
 
 
 # --- Main Training and Inference Script ---
@@ -281,18 +162,20 @@ def train(model, data_ids, batch_size=64, block_size=128, epochs=3, lr=3e-4):
     
     model.train()
     t0 = time.time()
-    for epoch in range(epochs):
-        x_batch, y_batch = get_batch(data_ids, batch_size, block_size, 'cuda')
+    for epoch in range(1, epochs + 1):
+        xb, yb = get_batch(data_ids, block_size, batch_size, 'cuda')
+        logits, loss_ce, aux_loss = model(xb, yb)
+        loss = loss_ce + cfg.aux_loss_weight * aux_loss
 
-        optimizer.zero_grad()
-        logits = model(x_batch)
-        loss = loss_fn(logits.view(-1, logits.size(-1)), y_batch.view(-1))
+        optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        optimizer.step()   
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
 
-        if epoch % max(1, epochs // 10) == 0 or epoch == (epochs - 1):
+        if epoch % max(1, epochs // 10) == 0 or epoch == 1:
             dt = time.time() - t0
-            print(f"epoch {epoch:5d}/{epochs} | loss {loss.item():.4f} | {dt:.1f}s")
+            print(f"epoch {epoch:5d}/{epochs} | loss {loss.item():.4f} (ce {loss_ce.item():.4f} + aux {aux_loss.item():.4f}) | {dt:.1f}s")
+            t0 = time.time()
 
     training_time = time.time() - t0
     print(f"Training time: {training_time:.2f} seconds")
@@ -346,11 +229,12 @@ if __name__ == "__main__":
 
     # Load model
     if args.model == "tinyGPT":
-        model = TinyGPT(vocab_size=tok.vocab_size, n_embd=128, n_layer=4, n_head=4, block_size=128).cuda()
+        cfg = MiniGPTConfig(vocab_size=tok.vocab_size)
+        model = MiniGPT(cfg).cuda()
     elif args.model == "MoE_MHA":
-        model = MoE_MHA(vocab_size=tok.vocab_size, n_embd=128, n_layer=4, n_head=4, block_size=128, num_experts=4, topk=1).cuda()
-    elif args.model == "MoE":
-        model = MoE(vocab_size=tok.vocab_size, n_embd=128, n_layer=4, num_experts=4).cuda()
+        # TODO
+        print("Not done yet")
+        exit(1)
 
     # Print model info
     print_model_info(model)
