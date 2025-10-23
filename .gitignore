@@ -1,0 +1,4 @@
+cnn/data
+*__pycache__*
+MoE/venv_pytorch
+cnn/*.pt
