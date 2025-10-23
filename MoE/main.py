@@ -7,15 +7,15 @@ import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
-
+# MHA model and it's config
 @dataclass
 class MiniGPTConfig:
     vocab_size: int
     n_layer: int = 4
-    n_head: int = 4
-    n_embd: int = 128
+    n_head: int = 8
+    n_embd: int = 256
     block_size: int = 128
-    dropout: float = 0.0
+    dropout: float = 0.1
 
     aux_loss_weight: float = 0.01
 
@@ -216,7 +216,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=2000)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--max_new_tokens", type=int, default=100)
+    parser.add_argument("--max_new_tokens", type=int, default=1000)
     args = parser.parse_args()
 
     # Load data
