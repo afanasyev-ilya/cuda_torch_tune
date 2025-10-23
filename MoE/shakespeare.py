@@ -140,7 +140,6 @@ class MoEGPTConfig(MiniGPTConfig):
 
     num_experts: int = 8  # Number of experts
     expert_dim: int = 256  # Hidden dimension of experts
-    top_k_experts: int = 2  # Number of experts to use for each token
 
 
 class Router(nn.Module):
@@ -329,7 +328,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Load data
-    text = load_text("./input.txt")
+    text = load_text("./shakespeare.txt")
 
     # tokenize data
     tok = CharTokenizer(text)
