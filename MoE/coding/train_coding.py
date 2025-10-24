@@ -90,20 +90,35 @@ class MiniGPTConfig:
     rope_base: float = 10000.0      # theta
     rope_scale: float = 1.0         # >1.0 = NTK-like scaling (allows longer ctx)
 
-# will be used for large-scale training
-'''
-@dataclass
-class MiniGPTConfig:
-    vocab_size: int
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
-    block_size: int = 1024
-    dropout: float = 0.1
+# ---- RoPE helper ----
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim: int, base: float = 10000.0, scale: float = 1.0, max_seq_len: int = 4096):
+        super().__init__()
+        assert dim % 2 == 0, "Rotary dim must be even"
+        self.dim = dim
+        self.base = base
+        self.scale = scale
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.max_seq_len_cached = 0
+        self.register_buffer("cos_cached", torch.empty(0), persistent=False)
+        self.register_buffer("sin_cached", torch.empty(0), persistent=False)
 
-    aux_loss_weight: float = 0.01
-'''
+    def _build_cache(self, seq_len: int, device, dtype):
+        t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype) * self.scale
+        freqs = torch.einsum("t,d->td", t, self.inv_freq)  # [T, dim/2]
+        emb = torch.cat([freqs, freqs], dim=-1)            # [T, dim]
+        cos = emb.cos().to(dtype)
+        sin = emb.sin().to(dtype)
+        # Store as [T, dim] - we'll reshape when applying
+        self.cos_cached = cos
+        self.sin_cached = sin
+        self.max_seq_len_cached = seq_len
 
+    def get_cos_sin(self, seq_len: int, device, dtype):
+        if seq_len > self.max_seq_len_cached or self.cos_cached.device != device:
+            self._build_cache(max(seq_len, self.max_seq_len_cached + 1), device, dtype)
+        return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
 
 class MHA(nn.Module):
     def __init__(self, config: MiniGPTConfig):
@@ -127,6 +142,34 @@ class MHA(nn.Module):
             torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size)
         )
 
+        self.use_rope = (getattr(config, "pos_encoding", "rope") == "rope")
+        if self.use_rope:
+            self.rope = RotaryEmbedding(self.head_dim, base=config.rope_base, scale=config.rope_scale, max_seq_len=config.block_size)
+
+    @staticmethod
+    def _rotate_half(x):
+        # [..., dim] with dim even
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    def _apply_rope(self, q, k):
+        # q,k: [B, H, T, D]
+        B, H, T, D = q.shape
+        
+        # Get cos/sin with shape [T, D]
+        cos, sin = self.rope.get_cos_sin(T, q.device, q.dtype)
+        
+        # Reshape cos/sin to [1, 1, T, D] for broadcasting with [B, H, T, D]
+        cos = cos.view(1, 1, T, D)
+        sin = sin.view(1, 1, T, D)
+        
+        # Apply RoPE to queries and keys
+        q_rotated = (q * cos) + (self._rotate_half(q) * sin)
+        k_rotated = (k * cos) + (self._rotate_half(k) * sin)
+        
+        return q_rotated, k_rotated
+
     def forward(self, x):
         B, T, C = x.shape
 
@@ -138,6 +181,9 @@ class MHA(nn.Module):
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, nh, T, hd)
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+
+        if self.use_rope:
+            q, k = self._apply_rope(q, k)
 
         att = (q @ k.transpose(-2, -1)) * self.scale  # (B, nh, T, T)
         att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float('-inf'))
@@ -180,7 +226,10 @@ class MiniGPT(nn.Module):
         super().__init__()
         self.config = config
         self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd)
-        self.pos_emb = nn.Embedding(config.block_size, config.n_embd)
+        self.pos_emb = None
+        if config.pos_encoding == "learned":
+            self.pos_emb = nn.Embedding(config.block_size, config.n_embd)
+        
         self.drop = nn.Dropout(config.dropout)
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
         self.ln_f = nn.LayerNorm(config.n_embd)
@@ -188,8 +237,10 @@ class MiniGPT(nn.Module):
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
-        pos = torch.arange(0, T, device=idx.device).unsqueeze(0)
-        x = self.tok_emb(idx) + self.pos_emb(pos)
+        x = self.tok_emb(idx)
+        if self.pos_emb is not None:
+            pos = torch.arange(0, T, device=idx.device).unsqueeze(0)
+            x = x + self.pos_emb(pos)
         x = self.drop(x)
         aux_total = x.new_zeros(())
         for block in self.blocks:
@@ -421,6 +472,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--max_new_tokens", type=int, default=1000)
+    parser.add_argument("--pos_encoding", type=str, choices=["rope", "learned"], default="rope")
     # tokenizer settings
     parser.add_argument("--tok_type", type=str, choices=["char", "bpe"], default="bpe")
     parser.add_argument("--tok_path", type=str, default="./tokenizer.json")  # load/save here
