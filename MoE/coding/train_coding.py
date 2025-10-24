@@ -82,8 +82,6 @@ def create_moegpt_large(vocab_size: int, **kwargs) -> MoEGPTConfig:
 
 ########################################################################################################
 
-# Byte-level BPE tokenizer (uses `tokenizers` lib) ----
-# pip install tokenizers
 from tokenizers import Tokenizer
 from tokenizers.models import BPE
 from tokenizers.trainers import BpeTrainer
@@ -116,11 +114,11 @@ class BPETokenizer:
             raise ValueError("Tokenizer not initialized. Call train() or load a file.")
         return self.tk.get_vocab_size()
 
-    def train(self, files, vocab_size=32000, min_freq=2, save_path="tokenizer.json"):
+    def train(self, files=None, dataset=None, vocab_size=32000, min_freq=2, save_path="tokenizer.json", max_samples=1000):
         """
-        Train on a list of file paths (e.g., ['input.txt']) and save to tokenizer.json.
+        Train on either files or a dataset.
         """
-        self.tk = Tokenizer(BPE(unk_token=None))  # byte-level covers all bytes; no UNK needed
+        self.tk = Tokenizer(BPE(unk_token=None))
         self.tk.pre_tokenizer = ByteLevel(add_prefix_space=False)
         self.tk.decoder = ByteLevelDecoder()
 
@@ -129,10 +127,36 @@ class BPETokenizer:
             min_frequency=min_freq,
             special_tokens=["<pad>", "<bos>", "<eos>"]
         )
-        self.tk.train(files=files, trainer=trainer)
+        
+        if files is not None:
+            # Original file-based training
+            self.tk.train(files=files, trainer=trainer)
+        elif dataset is not None:
+            # New dataset-based training
+            self._train_from_dataset(dataset, trainer, max_samples)
+        else:
+            raise ValueError("Either 'files' or 'dataset' must be provided")
+            
         self.tk.save(save_path)
         self._update_special_ids()
         return save_path
+
+    def _train_from_dataset(self, dataset, trainer, max_samples=1000):
+        """Train tokenizer from a Hugging Face dataset"""
+        def batch_iterator(batch_size=1000):
+            samples_processed = 0
+            for example in dataset:
+                if samples_processed >= max_samples:
+                    break
+                yield example["content"]
+                samples_processed += 1
+        
+        # Train using the iterator
+        self.tk.train_from_iterator(
+            batch_iterator(), 
+            trainer=trainer, 
+            length=max_samples  # Helps with progress reporting
+        )
 
     def encode(self, s: str, add_bos=False, add_eos=False):
         ids = self.tk.encode(s).ids
@@ -559,8 +583,14 @@ if __name__ == "__main__":
     # tokenize data
     tok = BPETokenizer(tokenizer_path=args.tok_path if os.path.exists(args.tok_path) else None)
     if tok.tk is None:
-        print(f"Training byte-level BPE tokenizer (vocab={args.vocab_size}) on input.txt ...")
-        tok.train(files=["./input.txt"], vocab_size=args.vocab_size, save_path=args.tok_path)
+        print(f"[STATUS] Training byte-level BPE tokenizer (vocab={args.vocab_size}) on dataset...")
+        # Use the dataset directly instead of files
+        tok.train(
+            dataset=dataset,  # Your loaded dataset
+            vocab_size=args.vocab_size, 
+            save_path=args.tok_path,
+            max_samples=1000  # Adjust as needed
+        )
         print(f"Saved tokenizer to {args.tok_path}")
     print("[STATUS] tokenizer prepared.")
 
