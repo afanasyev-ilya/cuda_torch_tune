@@ -506,9 +506,9 @@ def train(model, dataset, batch_size=64, epochs=3, lr=3e-4):
     dataloader = DataLoader(
         stream_dataset, 
         batch_size=batch_size,
-        shuffle=True,
-        num_workers=4,  # Parallel data loading
-        pin_memory=True  # Faster transfer to GPU
+        shuffle=True
+        #num_workers=4,  # Parallel data loading
+        #pin_memory=True  # Faster transfer to GPU
     )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
