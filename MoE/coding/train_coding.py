@@ -282,6 +282,10 @@ class MoEGPTConfig(MiniGPTConfig):
     num_experts: int = 8  # Number of experts
     expert_dim: int = 256  # Hidden dimension of experts
 
+    pos_encoding: str = "rope"      # "rope" or "learned"
+    rope_base: float = 10000.0      # theta
+    rope_scale: float = 1.0         # >1.0 = NTK-like scaling (allows longer ctx)
+
 
 class Router(nn.Module):
     def __init__(self, config: MoEGPTConfig):
@@ -331,7 +335,9 @@ class MoEGPT(nn.Module):
         super().__init__()
         self.config = config
         self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd)
-        self.pos_emb = nn.Embedding(config.block_size, config.n_embd)
+        self.pos_emb = None
+        if config.pos_encoding == "learned":
+            self.pos_emb = nn.Embedding(config.block_size, config.n_embd)
         self.drop = nn.Dropout(config.dropout)
 
         self.mha_blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer - 1)])
@@ -341,8 +347,12 @@ class MoEGPT(nn.Module):
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
-        pos = torch.arange(0, T, device=idx.device).unsqueeze(0)
-        x = self.tok_emb(idx) + self.pos_emb(pos)
+        
+        x = self.tok_emb(idx)
+        if self.pos_emb is not None:
+            pos = torch.arange(0, T, device=idx.device).unsqueeze(0)
+            x = x + self.pos_emb(pos)
+
         x = self.drop(x)
         aux_total = x.new_zeros(())
         
