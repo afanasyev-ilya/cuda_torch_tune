@@ -6,6 +6,42 @@ import time
 import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
+from dataclasses import dataclass
+
+########################################################################################################
+
+from dataclasses import dataclass, field
+
+@dataclass
+class BaseGPTConfig:
+    vocab_size: int
+    
+    block_size: int = 128
+    dropout: float = 0.1
+
+    aux_loss_weight: float = 0.01
+
+    # rope settings
+    pos_encoding: str = "rope"
+    rope_base: float = 10000.0
+    rope_scale: float = 1.0
+
+@dataclass
+class MiniGPTConfig(BaseGPTConfig):
+    n_layer: int = 4
+    n_head: int = 8
+    n_embd: int = 256
+
+@dataclass
+class MoEGPTConfig(BaseGPTConfig):
+    # MHA settings
+    n_layer: int = 4
+    n_head: int = 8
+    n_embd: int = 256
+
+    # MoE settings
+    num_experts: int = 8
+    expert_dim: int = 256
 
 ########################################################################################################
 
@@ -73,22 +109,6 @@ class BPETokenizer:
         return self.tk.decode(ids)
 
 ########################################################################################################
-
-# MHA model and it's config
-@dataclass
-class MiniGPTConfig:
-    vocab_size: int
-    n_layer: int = 4
-    n_head: int = 8
-    n_embd: int = 256
-    block_size: int = 128
-    dropout: float = 0.1
-
-    aux_loss_weight: float = 0.01
-
-    pos_encoding: str = "rope"      # "rope" or "learned"
-    rope_base: float = 10000.0      # theta
-    rope_scale: float = 1.0         # >1.0 = NTK-like scaling (allows longer ctx)
 
 # ---- RoPE helper ----
 class RotaryEmbedding(nn.Module):
@@ -267,25 +287,6 @@ class MiniGPT(nn.Module):
         return idx
 
 ########################################################################################################
-
-@dataclass
-class MoEGPTConfig(MiniGPTConfig):
-    vocab_size: int
-    n_layer: int = 4
-    n_head: int = 8
-    n_embd: int = 256
-    block_size: int = 128
-    dropout: float = 0.1
-
-    aux_loss_weight: float = 0.01
-
-    num_experts: int = 8  # Number of experts
-    expert_dim: int = 256  # Hidden dimension of experts
-
-    pos_encoding: str = "rope"      # "rope" or "learned"
-    rope_base: float = 10000.0      # theta
-    rope_scale: float = 1.0         # >1.0 = NTK-like scaling (allows longer ctx)
-
 
 class Router(nn.Module):
     def __init__(self, config: MoEGPTConfig):
