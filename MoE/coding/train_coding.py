@@ -6,11 +6,9 @@ import time
 import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 ########################################################################################################
-
-from dataclasses import dataclass, field
 
 @dataclass
 class BaseGPTConfig:
@@ -42,6 +40,41 @@ class MoEGPTConfig(BaseGPTConfig):
     # MoE settings
     num_experts: int = 8
     expert_dim: int = 256
+
+# Factory functions
+def create_minigpt_small(vocab_size: int, **kwargs) -> MiniGPTConfig:
+    """Small model for quick experiments (~4GB VRAM)"""
+    return MiniGPTConfig(
+        vocab_size=vocab_size,
+        n_layer=4, n_head=8, n_embd=256, block_size=1024,
+        **kwargs
+    )
+
+def create_minigpt_large(vocab_size: int, **kwargs) -> MiniGPTConfig:
+    """Large model for RTX A5000 (~16GB VRAM)"""
+    return MiniGPTConfig(
+        vocab_size=vocab_size, 
+        n_layer=12, n_head=12, n_embd=768, block_size=2048,
+        **kwargs
+    )
+
+def create_moegpt_small(vocab_size: int, **kwargs) -> MoEGPTConfig:
+    """Small MoE model (~6GB VRAM)"""
+    return MoEGPTConfig(
+        vocab_size=vocab_size,
+        n_layer=4, n_head=8, n_embd=512, block_size=1024,
+        num_experts=8, expert_dim=512,
+        **kwargs
+    )
+
+def create_moegpt_large(vocab_size: int, **kwargs) -> MoEGPTConfig:
+    """Large MoE model for RTX A5000 (~20GB VRAM)"""
+    return MoEGPTConfig(
+        vocab_size=vocab_size,
+        n_layer=8, n_head=12, n_embd=768, block_size=1024,
+        num_experts=16, expert_dim=768,
+        **kwargs
+    )
 
 ########################################################################################################
 
@@ -509,11 +542,11 @@ if __name__ == "__main__":
     # Load model
     if args.model == "miniGPT":
         print("miniGPT")
-        cfg = MiniGPTConfig(vocab_size=tok.vocab_size)
+        cfg = create_minigpt_small(vocab_size=tok.vocab_size)
         model = MiniGPT(cfg).cuda()
     elif args.model == "MoE":
         print("using MoE model")
-        cfg = MoEGPTConfig(vocab_size=tok.vocab_size)
+        cfg = create_moegpt_small(vocab_size=tok.vocab_size)
         model = MoEGPT(cfg).cuda()
     print("[STATUS] model created and moved to CUDA.")
 
