@@ -29,12 +29,6 @@ class BaseGPTConfig:
     rope_scale: float = 1.0
 
 @dataclass
-class MiniGPTConfig(BaseGPTConfig):
-    n_layer: int = 4
-    n_head: int = 8
-    n_embd: int = 256
-
-@dataclass
 class MoEGPTConfig(BaseGPTConfig):
     # MHA settings
     n_layer: int = 4
@@ -44,23 +38,6 @@ class MoEGPTConfig(BaseGPTConfig):
     # MoE settings
     num_experts: int = 8
     expert_dim: int = 256
-
-# Factory functions
-def create_minigpt_small(vocab_size: int, **kwargs) -> MiniGPTConfig:
-    """Small model for quick experiments (~4GB VRAM)"""
-    return MiniGPTConfig(
-        vocab_size=vocab_size,
-        n_layer=4, n_head=8, n_embd=256, block_size=CONTEXT_SIZE,
-        **kwargs
-    )
-
-def create_minigpt_large(vocab_size: int, **kwargs) -> MiniGPTConfig:
-    """Large model for RTX A5000 (~16GB VRAM)"""
-    return MiniGPTConfig(
-        vocab_size=vocab_size, 
-        n_layer=12, n_head=12, n_embd=768, block_size=CONTEXT_SIZE,
-        **kwargs
-    )
 
 def create_moegpt_small(vocab_size: int, **kwargs) -> MoEGPTConfig:
     """Small MoE model (~6GB VRAM)"""
@@ -75,8 +52,8 @@ def create_moegpt_large(vocab_size: int, **kwargs) -> MoEGPTConfig:
     """Large MoE model for RTX A5000 (~20GB VRAM)"""
     return MoEGPTConfig(
         vocab_size=vocab_size,
-        n_layer=8, n_head=12, n_embd=768, block_size=CONTEXT_SIZE,
-        num_experts=16, expert_dim=768,
+        n_layer=3, n_head=12, n_embd=768, block_size=CONTEXT_SIZE,
+        num_experts=16, expert_dim=2048,
         **kwargs
     )
 
@@ -202,7 +179,7 @@ class RotaryEmbedding(nn.Module):
         return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
 
 class MHA(nn.Module):
-    def __init__(self, config: MiniGPTConfig):
+    def __init__(self, config: MoEGPTConfig):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         self.n_head = config.n_head
@@ -290,7 +267,7 @@ class DenseFFN(nn.Module):
         return self.net(x)
 
 class Block(nn.Module):
-    def __init__(self, config: MiniGPTConfig):
+    def __init__(self, config: MoEGPTConfig):
         super().__init__()
         self.ln1 = nn.LayerNorm(config.n_embd)
         self.ln2 = nn.LayerNorm(config.n_embd)
@@ -302,53 +279,6 @@ class Block(nn.Module):
         x = x + self.ff(self.ln2(x))
         return x, x.new_zeros(())  # zero aux
 
-class MiniGPT(nn.Module):
-    def __init__(self, config: MiniGPTConfig):
-        super().__init__()
-        self.config = config
-        self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd)
-        self.pos_emb = None
-        if config.pos_encoding == "learned":
-            self.pos_emb = nn.Embedding(config.block_size, config.n_embd)
-        
-        self.drop = nn.Dropout(config.dropout)
-        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
-        self.ln_f = nn.LayerNorm(config.n_embd)
-        self.fc = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-
-    def forward(self, idx, targets=None):
-        B, T = idx.shape
-        x = self.tok_emb(idx)
-        if self.pos_emb is not None:
-            pos = torch.arange(0, T, device=idx.device).unsqueeze(0)
-            x = x + self.pos_emb(pos)
-        x = self.drop(x)
-        aux_total = x.new_zeros(())
-        for block in self.blocks:
-            x, aux = block(x)
-            aux_total = aux_total + aux
-
-        x = self.ln_f(x)
-        logits = self.fc(x)
-
-        loss = None
-        if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-        return logits, loss, aux_total
-
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens: int):
-        for _ in range(max_new_tokens):
-            idx_cond = idx[:, -self.config.block_size:]
-            logits, _, _ = self.forward(idx_cond)
-            logits = logits[:, -1, :]
-            probs = F.softmax(logits, dim=-1)
-            next_id = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat([idx, next_id], dim=1)
-        return idx
-
-########################################################################################################
-
 class Router(nn.Module):
     def __init__(self, config: MoEGPTConfig):
         super().__init__()
@@ -359,6 +289,29 @@ class Router(nn.Module):
         logits = self.fc(x)  # Raw logits to determine routing for each token
         probs = F.softmax(logits, dim=-1)  # (B, T, num_experts)
         return probs
+
+class TopKRouter(nn.Module):
+    def __init__(self, config: MoEGPTConfig):
+        super().__init__()
+        # Deeper routing network for better expert selection
+        self.net = nn.Sequential(
+            nn.Linear(config.n_embd, config.n_embd // 2),
+            nn.GELU(),
+            nn.Linear(config.n_embd // 2, config.num_experts)
+        )
+        
+    def forward(self, x):
+        logits = self.net(x)
+        # Use gumbel softmax for differentiable top-k
+        if self.training:
+            return F.gumbel_softmax(logits, tau=1.0, hard=True, dim=-1)
+        else:
+            # During inference, use top-2 experts
+            probs = F.softmax(logits, dim=-1)
+            top2_probs, top2_indices = torch.topk(probs, k=2, dim=-1)
+            # Renormalize
+            top2_probs = top2_probs / top2_probs.sum(dim=-1, keepdim=True)
+            return top2_probs, top2_indices        
 
 class MoEExpert(nn.Module):
     def __init__(self, config: MoEGPTConfig):
@@ -562,10 +515,8 @@ def inference(model, tok, prompt = "", max_new_tokens=100):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # LLM settings
-    parser.add_argument("--model", type=str, choices=["miniGPT", "MoE"], required=True)
-    # parser.add_argument("--train_data", type=str, required=True)
     parser.add_argument("--epochs", type=int, default=2000)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--max_new_tokens", type=int, default=1000)
     parser.add_argument("--pos_encoding", type=str, choices=["rope", "learned"], default="rope")
@@ -595,14 +546,8 @@ if __name__ == "__main__":
     print("[STATUS] tokenizer prepared.")
 
     # Load model
-    if args.model == "miniGPT":
-        print("miniGPT")
-        cfg = create_minigpt_small(vocab_size=tok.vocab_size)
-        model = MiniGPT(cfg).cuda()
-    elif args.model == "MoE":
-        print("using MoE model")
-        cfg = create_moegpt_small(vocab_size=tok.vocab_size)
-        model = MoEGPT(cfg).cuda()
+    cfg = create_moegpt_large(vocab_size=tok.vocab_size)
+    model = MoEGPT(cfg).cuda()
     print("[STATUS] model created and moved to CUDA.")
 
     # Print model info
