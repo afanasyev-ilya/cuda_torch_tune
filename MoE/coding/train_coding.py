@@ -7,14 +7,18 @@ import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
 from dataclasses import dataclass, field
+from datasets import load_dataset
+from torch.utils.data import DataLoader, Dataset
 
 ########################################################################################################
+
+CONTEXT_SIZE = 512
 
 @dataclass
 class BaseGPTConfig:
     vocab_size: int
     
-    block_size: int = 128
+    block_size: int = CONTEXT_SIZE
     dropout: float = 0.1
 
     aux_loss_weight: float = 0.01
@@ -46,7 +50,7 @@ def create_minigpt_small(vocab_size: int, **kwargs) -> MiniGPTConfig:
     """Small model for quick experiments (~4GB VRAM)"""
     return MiniGPTConfig(
         vocab_size=vocab_size,
-        n_layer=4, n_head=8, n_embd=256, block_size=1024,
+        n_layer=4, n_head=8, n_embd=256, block_size=CONTEXT_SIZE,
         **kwargs
     )
 
@@ -54,7 +58,7 @@ def create_minigpt_large(vocab_size: int, **kwargs) -> MiniGPTConfig:
     """Large model for RTX A5000 (~16GB VRAM)"""
     return MiniGPTConfig(
         vocab_size=vocab_size, 
-        n_layer=12, n_head=12, n_embd=768, block_size=2048,
+        n_layer=12, n_head=12, n_embd=768, block_size=CONTEXT_SIZE,
         **kwargs
     )
 
@@ -62,7 +66,7 @@ def create_moegpt_small(vocab_size: int, **kwargs) -> MoEGPTConfig:
     """Small MoE model (~6GB VRAM)"""
     return MoEGPTConfig(
         vocab_size=vocab_size,
-        n_layer=4, n_head=8, n_embd=512, block_size=1024,
+        n_layer=4, n_head=8, n_embd=512, block_size=CONTEXT_SIZE,
         num_experts=8, expert_dim=512,
         **kwargs
     )
@@ -71,7 +75,7 @@ def create_moegpt_large(vocab_size: int, **kwargs) -> MoEGPTConfig:
     """Large MoE model for RTX A5000 (~20GB VRAM)"""
     return MoEGPTConfig(
         vocab_size=vocab_size,
-        n_layer=8, n_head=12, n_embd=768, block_size=1024,
+        n_layer=8, n_head=12, n_embd=768, block_size=CONTEXT_SIZE,
         num_experts=16, expert_dim=768,
         **kwargs
     )
@@ -417,31 +421,42 @@ class MoEGPT(nn.Module):
 
 ########################################################################################################
 
-# --- Main Training and Inference Script ---
-def load_text(path: str) -> str:
-    if path and os.path.exists(path):
-        with open(path, 'r', encoding='utf-8') as f:
-            return f.read()
-    else:
-        print("No dataset found")
-        exit(1)
+class StreamingDataset(Dataset):
+    def __init__(self, hf_dataset, tokenizer, seq_length=CONTEXT_SIZE, max_samples=1000):
+        self.hf_dataset = hf_dataset
+        self.tokenizer = tokenizer
+        self.seq_length = seq_length
+        self.max_samples = max_samples
+        self._current_buffer = []
+        self._fill_buffer()
+    
+    def _fill_buffer(self):
+        """Fill buffer with tokenized samples"""
+        self._current_buffer = []
+        for i, row in enumerate(self.hf_dataset):
+            if i >= self.max_samples:
+                break
+            # Tokenize and split into sequences
+            tokens = self.tokenizer.encode(row["content"])
+            # Split into chunks of seq_length
+            for i in range(0, len(tokens), self.seq_length):
+                chunk = tokens[i:i + self.seq_length]
+                if len(chunk) == self.seq_length:  # Only use complete sequences
+                    self._current_buffer.append(torch.tensor(chunk, dtype=torch.long))
+    
+    def __len__(self):
+        return len(self._current_buffer)
+    
+    def __getitem__(self, idx):
+        return self._current_buffer[idx]
 
-
-def get_batch(data, batch_size, block_size):
-    # Non-naive batching: efficient handling
-    ix = torch.randint(0, len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.tensor(data[i:i + block_size]) for i in ix])
-    y = torch.stack([torch.tensor(data[i + 1:i + 1 + block_size]) for i in ix])
-    return x, y
-
-
-def get_batch(data_ids, block_size, batch_size, device):
-    # sample random offsets
-    ix = torch.randint(0, data_ids.size(0) - block_size - 1, (batch_size,))
-    x = torch.stack([data_ids[i:i+block_size] for i in ix])
-    y = torch.stack([data_ids[i+1:i+1+block_size] for i in ix])
-    return x.to(device), y.to(device)
-
+def get_batch_from_dataloader(dataloader):
+    """Get batch from DataLoader instead of random sampling"""
+    for batch in dataloader:
+        x = batch[:, :-1]  # Input sequence
+        y = batch[:, 1:]   # Target sequence (shifted by one)
+        return x, y
+    return None, None
 
 def print_model_info(model):
     # Print model parameter count and estimated size
@@ -451,7 +466,27 @@ def print_model_info(model):
     print(f"Estimated model size: {estimated_size:.2f} MB")
 
 
-def train(model, data_ids, batch_size=64, block_size=128, epochs=3, lr=3e-4):
+def print_memory_stats(step_name=""):
+    print(f"\n--- Memory Stats {step_name} ---")
+    print(f"Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+    print(f"Reserved: {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
+    print(f"Max Allocated: {torch.cuda.max_memory_allocated() / 1024**2:.2f} MB")
+    torch.cuda.reset_peak_memory_stats()  # Reset max counter
+
+
+def train(model, dataset, batch_size=64, epochs=3, lr=3e-4):
+    # Create streaming dataset
+    stream_dataset = StreamingDataset(dataset, tok, seq_length=CONTEXT_SIZE)
+    
+    # Create DataLoader with multiple workers
+    dataloader = DataLoader(
+        stream_dataset, 
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=4,  # Parallel data loading
+        pin_memory=True  # Faster transfer to GPU
+    )
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     loss_fn = nn.CrossEntropyLoss()
     
@@ -459,7 +494,13 @@ def train(model, data_ids, batch_size=64, block_size=128, epochs=3, lr=3e-4):
     model.train()
     t0 = time.time()
     for epoch in range(1, epochs + 1):
-        xb, yb = get_batch(data_ids, block_size, batch_size, 'cuda')
+        xb, yb = get_batch_from_dataloader(dataloader)
+        xb = xb.to('cuda')
+        yb = yb.to('cuda')
+        if xb is None:  # Reset if dataset is exhausted
+            dataloader.dataset._fill_buffer()
+            continue
+
         logits, loss_ce, aux_loss = model(xb, yb)
         loss = loss_ce + cfg.aux_loss_weight * aux_loss
 
@@ -471,23 +512,10 @@ def train(model, data_ids, batch_size=64, block_size=128, epochs=3, lr=3e-4):
         if epoch % max(1, epochs // 10) == 0 or epoch == 1:
             dt = time.time() - t0
             print(f"epoch {epoch:5d}/{epochs} | loss {loss.item():.4f} (ce {loss_ce.item():.4f} + aux {aux_loss.item():.4f}) | {dt:.1f}s")
+            print_memory_stats()
 
     training_time = time.time() - t0
     print(f"Training time: {training_time:.2f} seconds")
-
-
-class CharTokenizer:
-    def __init__(self, text: str):
-        vocab = sorted(set(text))
-        self.stoi = {ch: i for i, ch in enumerate(vocab)}
-        self.itos = {i: ch for i, ch in enumerate(vocab)}
-        self.vocab_size = len(vocab)
-
-    def encode(self, s: str):
-        return [self.stoi[c] for c in s]
-
-    def decode(self, ids):
-        return ''.join(self.itos[i] for i in ids)
 
 
 def inference(model, tok, prompt = "", max_new_tokens=100):
@@ -511,33 +539,30 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # LLM settings
     parser.add_argument("--model", type=str, choices=["miniGPT", "MoE"], required=True)
-    parser.add_argument("--train_data", type=str, required=True)
+    # parser.add_argument("--train_data", type=str, required=True)
     parser.add_argument("--epochs", type=int, default=2000)
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--max_new_tokens", type=int, default=1000)
     parser.add_argument("--pos_encoding", type=str, choices=["rope", "learned"], default="rope")
     # tokenizer settings
-    parser.add_argument("--tok_type", type=str, choices=["char", "bpe"], default="bpe")
     parser.add_argument("--tok_path", type=str, default="./tokenizer.json")  # load/save here
     parser.add_argument("--vocab_size", type=int, default=32000)             # for BPE training
     args = parser.parse_args()
 
     # Load data
-    text = load_text(args.train_data)
+    print("[STATUS] preparing dataset...")
+    #dataset = load_dataset("codeparrot/codeparrot-clean", split="train", streaming=True)
+    dataset = load_dataset("/home/i.afanasyev/codeparrot-clean", split="train", streaming=True)
     print("[STATUS] data loaded.")
 
     # tokenize data
-    if args.tok_type == "char":
-        tok = CharTokenizer(text)
-    else:
-        tok = BPETokenizer(tokenizer_path=args.tok_path if os.path.exists(args.tok_path) else None)
-        if tok.tk is None:
-            print(f"Training byte-level BPE tokenizer (vocab={args.vocab_size}) on input.txt ...")
-            tok.train(files=["./input.txt"], vocab_size=args.vocab_size, save_path=args.tok_path)
-            print(f"Saved tokenizer to {args.tok_path}")
-    data_ids = torch.tensor(tok.encode(text), dtype=torch.long)
-    print("[STATUS] data tokenized.")
+    tok = BPETokenizer(tokenizer_path=args.tok_path if os.path.exists(args.tok_path) else None)
+    if tok.tk is None:
+        print(f"Training byte-level BPE tokenizer (vocab={args.vocab_size}) on input.txt ...")
+        tok.train(files=["./input.txt"], vocab_size=args.vocab_size, save_path=args.tok_path)
+        print(f"Saved tokenizer to {args.tok_path}")
+    print("[STATUS] tokenizer prepared.")
 
     # Load model
     if args.model == "miniGPT":
@@ -554,7 +579,7 @@ if __name__ == "__main__":
     print_model_info(model)
 
     # Train the model
-    train(model, data_ids, batch_size=args.batch_size, epochs=args.epochs, lr=args.lr)
+    train(model, dataset, batch_size=args.batch_size, epochs=args.epochs, lr=args.lr)
 
     # Generate text with the trained model
     output = inference(model, tok, "def binary_search(arr, target):\n", max_new_tokens=args.max_new_tokens)
