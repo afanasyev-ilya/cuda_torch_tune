@@ -9,6 +9,71 @@ from typing import Optional, Tuple
 
 ########################################################################################################
 
+# Byte-level BPE tokenizer (uses `tokenizers` lib) ----
+# pip install tokenizers
+from tokenizers import Tokenizer
+from tokenizers.models import BPE
+from tokenizers.trainers import BpeTrainer
+from tokenizers.pre_tokenizers import ByteLevel
+from tokenizers.decoders import ByteLevel as ByteLevelDecoder
+
+class BPETokenizer:
+    def __init__(self, tokenizer_path: str = None):
+        """
+        If tokenizer_path exists, loads it. Otherwise call train(...) first.
+        """
+        if tokenizer_path is not None and os.path.exists(tokenizer_path):
+            self.tk = Tokenizer.from_file(tokenizer_path)
+        else:
+            self.tk = None  # call train() to create
+
+        self._update_special_ids()
+
+    def _update_special_ids(self):
+        if self.tk is None:
+            self.pad_id = self.bos_id = self.eos_id = None
+            return
+        self.pad_id = self.tk.token_to_id("<pad>")
+        self.bos_id = self.tk.token_to_id("<bos>")
+        self.eos_id = self.tk.token_to_id("<eos>")
+
+    @property
+    def vocab_size(self):
+        if self.tk is None:
+            raise ValueError("Tokenizer not initialized. Call train() or load a file.")
+        return self.tk.get_vocab_size()
+
+    def train(self, files, vocab_size=32000, min_freq=2, save_path="tokenizer.json"):
+        """
+        Train on a list of file paths (e.g., ['input.txt']) and save to tokenizer.json.
+        """
+        self.tk = Tokenizer(BPE(unk_token=None))  # byte-level covers all bytes; no UNK needed
+        self.tk.pre_tokenizer = ByteLevel(add_prefix_space=False)
+        self.tk.decoder = ByteLevelDecoder()
+
+        trainer = BpeTrainer(
+            vocab_size=vocab_size,
+            min_frequency=min_freq,
+            special_tokens=["<pad>", "<bos>", "<eos>"]
+        )
+        self.tk.train(files=files, trainer=trainer)
+        self.tk.save(save_path)
+        self._update_special_ids()
+        return save_path
+
+    def encode(self, s: str, add_bos=False, add_eos=False):
+        ids = self.tk.encode(s).ids
+        if add_bos and self.bos_id is not None:
+            ids = [self.bos_id] + ids
+        if add_eos and self.eos_id is not None:
+            ids = ids + [self.eos_id]
+        return ids
+
+    def decode(self, ids):
+        return self.tk.decode(ids)
+
+########################################################################################################
+
 # MHA model and it's config
 @dataclass
 class MiniGPTConfig:
@@ -21,6 +86,24 @@ class MiniGPTConfig:
 
     aux_loss_weight: float = 0.01
 
+    pos_encoding: str = "rope"      # "rope" or "learned"
+    rope_base: float = 10000.0      # theta
+    rope_scale: float = 1.0         # >1.0 = NTK-like scaling (allows longer ctx)
+
+# will be used for large-scale training
+'''
+@dataclass
+class MiniGPTConfig:
+    vocab_size: int
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
+    block_size: int = 1024
+    dropout: float = 0.1
+
+    aux_loss_weight: float = 0.01
+'''
+
 
 class MHA(nn.Module):
     def __init__(self, config: MiniGPTConfig):
@@ -30,7 +113,11 @@ class MHA(nn.Module):
         self.head_dim = config.n_embd // config.n_head
         self.scale = self.head_dim ** -0.5
 
-        self.qkv = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
+        # we use n_embed x n_embed because these are joint projections of qkv among all heads
+        self.key = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.query = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.value = nn.Linear(config.n_embd, config.n_embd, bias=False)
+
         self.proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
         self.dropout = nn.Dropout(config.dropout)
 
@@ -42,8 +129,11 @@ class MHA(nn.Module):
 
     def forward(self, x):
         B, T, C = x.shape
-        qkv = self.qkv(x)  # (B, T, 3C)
-        q, k, v = qkv.chunk(3, dim=-1)
+
+        k = self.key(x)
+        q = self.query(x)
+        v = self.value(x)
+
         # shape into heads
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, nh, T, hd)
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
@@ -270,6 +360,7 @@ def train(model, data_ids, batch_size=64, block_size=128, epochs=3, lr=3e-4):
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     loss_fn = nn.CrossEntropyLoss()
     
+    print("[STATUS] training started....")
     model.train()
     t0 = time.time()
     for epoch in range(1, epochs + 1):
@@ -304,11 +395,14 @@ class CharTokenizer:
         return ''.join(self.itos[i] for i in ids)
 
 
-def inference(model, tok, max_new_tokens=100):
+def inference(model, tok, prompt = "", max_new_tokens=100):
     model.eval()
 
     # prepare empty context for now
     ctx = torch.zeros((1, 1), dtype=torch.long).to('cuda')
+
+    ids = tok.encode(prompt)
+    ctx = torch.tensor([ids], dtype=torch.long, device='cuda')
 
     # infer
     out = model.generate(ctx, max_new_tokens)[0].tolist()
@@ -320,19 +414,34 @@ def inference(model, tok, max_new_tokens=100):
 # --- Main ---
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    # LLM settings
     parser.add_argument("--model", type=str, choices=["miniGPT", "MoE"], required=True)
+    parser.add_argument("--train_data", type=str, required=True)
     parser.add_argument("--epochs", type=int, default=2000)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--max_new_tokens", type=int, default=1000)
+    # tokenizer settings
+    parser.add_argument("--tok_type", type=str, choices=["char", "bpe"], default="bpe")
+    parser.add_argument("--tok_path", type=str, default="./tokenizer.json")  # load/save here
+    parser.add_argument("--vocab_size", type=int, default=32000)             # for BPE training
     args = parser.parse_args()
 
     # Load data
-    text = load_text("./shakespeare.txt")
+    text = load_text(args.train_data)
+    print("[STATUS] data loaded.")
 
     # tokenize data
-    tok = CharTokenizer(text)
+    if args.tok_type == "char":
+        tok = CharTokenizer(text)
+    else:
+        tok = BPETokenizer(tokenizer_path=args.tok_path if os.path.exists(args.tok_path) else None)
+        if tok.tk is None:
+            print(f"Training byte-level BPE tokenizer (vocab={args.vocab_size}) on input.txt ...")
+            tok.train(files=["./input.txt"], vocab_size=args.vocab_size, save_path=args.tok_path)
+            print(f"Saved tokenizer to {args.tok_path}")
     data_ids = torch.tensor(tok.encode(text), dtype=torch.long)
+    print("[STATUS] data tokenized.")
 
     # Load model
     if args.model == "miniGPT":
@@ -343,6 +452,7 @@ if __name__ == "__main__":
         print("using MoE model")
         cfg = MoEGPTConfig(vocab_size=tok.vocab_size)
         model = MoEGPT(cfg).cuda()
+    print("[STATUS] model created and moved to CUDA.")
 
     # Print model info
     print_model_info(model)
@@ -351,6 +461,6 @@ if __name__ == "__main__":
     train(model, data_ids, batch_size=args.batch_size, epochs=args.epochs, lr=args.lr)
 
     # Generate text with the trained model
-    output = inference(model, tok, max_new_tokens=args.max_new_tokens)
-    print("Generated text:", output)
+    output = inference(model, tok, "def binary_search(arr, target):\n", max_new_tokens=args.max_new_tokens)
+    print("Generated text:\n", output)
 
