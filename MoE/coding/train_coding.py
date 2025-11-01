@@ -9,6 +9,7 @@ from typing import Optional, Tuple
 from dataclasses import dataclass, field
 from datasets import load_dataset
 from torch.utils.data import DataLoader, Dataset
+from checkpoints import *
 
 ########################################################################################################
 
@@ -39,24 +40,6 @@ class MoEGPTConfig(BaseGPTConfig):
     num_experts: int = 8
     expert_dim: int = 256
 
-def create_moegpt_small(vocab_size: int, **kwargs) -> MoEGPTConfig:
-    """Small MoE model (~6GB VRAM)"""
-    return MoEGPTConfig(
-        vocab_size=vocab_size,
-        n_layer=4, n_head=8, n_embd=512, block_size=CONTEXT_SIZE,
-        num_experts=8, expert_dim=512,
-        **kwargs
-    )
-
-def create_moegpt_large(vocab_size: int, **kwargs) -> MoEGPTConfig:
-    """Large MoE model for RTX A5000 (~20GB VRAM)"""
-    return MoEGPTConfig(
-        vocab_size=vocab_size,
-        n_layer=3, n_head=12, n_embd=768, block_size=CONTEXT_SIZE,
-        num_experts=16, expert_dim=4096,
-        **kwargs
-    )
-
 def create_moegpt_deepseek_style(vocab_size: int, **kwargs) -> MoEGPTConfig:
     """DeepSeek-style alternating MHA -> MoE architecture"""
     return MoEGPTConfig(
@@ -72,24 +55,6 @@ def create_moegpt_deepseek_style(vocab_size: int, **kwargs) -> MoEGPTConfig:
         dropout=0.1,
         aux_loss_weight=0.01,
         pos_encoding="rope",
-        **kwargs
-    )
-
-def create_moegpt_a5000_optimized(vocab_size: int, **kwargs) -> MoEGPTConfig:
-    """Optimized configuration for RTX A5000 (24GB VRAM)"""
-    return MoEGPTConfig(
-        vocab_size=vocab_size,
-        # Optimized for Python coding: wider attention, deeper MoE
-        n_layer=8,           # Increased from 3
-        n_head=16,           # Increased from 12
-        n_embd=1024,         # Increased from 768
-        block_size=CONTEXT_SIZE,
-        # MoE scaling - this is where you get most bang for buck
-        num_experts=32,      # Increased from 16
-        expert_dim=2048,     # Reduced from 4096 for balance
-        dropout=0.1,
-        aux_loss_weight=0.01,
-        pos_encoding="rope",  # Keep RoPE for better long context
         **kwargs
     )
 
@@ -552,19 +517,38 @@ def analyze_memory_usage(model, batch_size=16, seq_length=512):
     return total_params, layer_breakdown
 
 
-def train(model, dataset, batch_size=16, epochs=3, lr=3e-4, grad_accum_steps=2):
-    stream_dataset = StreamingDataset(dataset, tok, seq_length=CONTEXT_SIZE)
+def train(model, dataset, batch_size=16, epochs=3, lr=3e-4, grad_accum_steps=2, 
+          checkpoint_dir="checkpoints", save_every=10, resume_from=None):
+    """Training with checkpoint saving and resuming"""
     
+    stream_dataset = StreamingDataset(dataset, tok, seq_length=CONTEXT_SIZE)
     dataloader = DataLoader(stream_dataset, batch_size=batch_size, shuffle=True)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1)
-    scaler = torch.cuda.amp.GradScaler()  # Mixed precision
+    scaler = torch.cuda.amp.GradScaler()
     
-    print("[STATUS] training started....")
+    start_epoch = 1
+    best_loss = float('inf')
+    
+    # Resume from checkpoint if specified
+    if resume_from == "latest":
+        latest_checkpoint = find_latest_checkpoint(checkpoint_dir)
+        if latest_checkpoint:
+            start_epoch, best_loss = load_checkpoint(model, optimizer, latest_checkpoint)
+            start_epoch += 1  # Start from next epoch
+            print(f"Resuming training from epoch {start_epoch}")
+    elif resume_from and os.path.exists(resume_from):
+        start_epoch, best_loss = load_checkpoint(model, optimizer, resume_from)
+        start_epoch += 1
+        print(f"Resuming training from epoch {start_epoch}")
+    
+    print(f"[STATUS] Training started from epoch {start_epoch}...")
     model.train()
     
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         total_loss = 0
+        num_batches = 0
+        
         for step, batch in enumerate(dataloader):
             xb = batch[:, :-1].to('cuda', non_blocking=True)
             yb = batch[:, 1:].to('cuda', non_blocking=True)
@@ -584,11 +568,42 @@ def train(model, dataset, batch_size=16, epochs=3, lr=3e-4, grad_accum_steps=2):
                 optimizer.zero_grad(set_to_none=True)
 
             total_loss += loss.item() * grad_accum_steps
+            num_batches += 1
 
             if step % 100 == 0:
-                print(f"epoch {epoch} | step {step} | loss {total_loss/(step+1):.4f}")
+                avg_loss = total_loss / (step + 1)
+                print(f"epoch {epoch:3d}/{epochs} | step {step:4d} | loss {avg_loss:.4f}")
 
-        print(f"epoch {epoch} | avg_loss {total_loss/len(dataloader):.4f}")
+        avg_epoch_loss = total_loss / num_batches
+        print(f"epoch {epoch:3d}/{epochs} | avg_loss {avg_epoch_loss:.4f}")
+        
+        # Save checkpoint
+        if epoch % save_every == 0 or epoch == epochs:
+            save_checkpoint(model, optimizer, epoch, avg_epoch_loss, checkpoint_dir)
+            
+        # Save best model
+        if avg_epoch_loss < best_loss:
+            best_loss = avg_epoch_loss
+            save_checkpoint(model, optimizer, epoch, avg_epoch_loss, checkpoint_dir)
+            # Also save as best model
+            best_path = f"{checkpoint_dir}/checkpoint_best.pt"
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': avg_epoch_loss,
+                'config': model.config.__dict__,
+            }, best_path)
+            print(f"New best model saved with loss: {best_loss:.4f}")
+        
+        # Generate sample to monitor progress
+        if epoch % 20 == 0:
+            model.eval()
+            sample = inference(model, tok, "def binary_search(arr, target):\n", max_new_tokens=100)
+            print(f"\n--- Epoch {epoch} Sample ---")
+            print(sample[:500] + "..." if len(sample) > 500 else sample)
+            print("---" + "-" * 20)
+            model.train()
 
 
 def inference(model, tok, prompt = "", max_new_tokens=100):
@@ -617,6 +632,7 @@ def print_torch_stats():
     with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=True):
         print("All backends enabled for context")
 
+
 # --- Main ---
 if __name__ == "__main__":
     print_torch_stats()
@@ -629,14 +645,22 @@ if __name__ == "__main__":
     parser.add_argument("--max_new_tokens", type=int, default=1000)
     parser.add_argument("--pos_encoding", type=str, choices=["rope", "learned"], default="rope")
     parser.add_argument("--model_arch", type=str, choices=["deepseek", "optimized"], default="deepseek")
+    
+    # Checkpoint settings
+    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
+    parser.add_argument("--save_every", type=int, default=50, help="Save checkpoint every N epochs")
+    parser.add_argument("--resume_from", type=str, default=None, 
+                       help="Resume from 'latest', or path to specific checkpoint")
+    parser.add_argument("--save_final_model", action="store_true", default=True, 
+                       help="Save final model after training")
+    
     # tokenizer settings
-    parser.add_argument("--tok_path", type=str, default="./tokenizer.json")  # load/save here
-    parser.add_argument("--vocab_size", type=int, default=32000)             # for BPE training
+    parser.add_argument("--tok_path", type=str, default="./tokenizer.json")
+    parser.add_argument("--vocab_size", type=int, default=32000)
     args = parser.parse_args()
 
     # Load data
     print("[STATUS] preparing dataset...")
-    #dataset = load_dataset("codeparrot/codeparrot-clean", split="train", streaming=True)
     dataset = load_dataset("/home/i.afanasyev/codeparrot-clean", split="train", streaming=True)
     print("[STATUS] data loaded.")
 
@@ -644,40 +668,83 @@ if __name__ == "__main__":
     tok = BPETokenizer(tokenizer_path=args.tok_path if os.path.exists(args.tok_path) else None)
     if tok.tk is None:
         print(f"[STATUS] Training byte-level BPE tokenizer (vocab={args.vocab_size}) on dataset...")
-        # Use the dataset directly instead of files
         tok.train(
-            dataset=dataset,  # Your loaded dataset
+            dataset=dataset,
             vocab_size=args.vocab_size, 
             save_path=args.tok_path,
-            max_samples=1000  # Adjust as needed
+            max_samples=1000
         )
         print(f"Saved tokenizer to {args.tok_path}")
     print("[STATUS] tokenizer prepared.")
 
-    # Load model based on architecture choice
-    if args.model_arch == "deepseek":
-        cfg = create_moegpt_deepseek_style(vocab_size=tok.vocab_size)
-        print("[ARCHITECTURE] Using DeepSeek-style: alternating MHA -> MoE blocks")
+    # Load or create model
+    if args.resume_from and args.resume_from != "latest" and os.path.exists(args.resume_from):
+        # Load existing model from checkpoint
+        model = load_model(MoEGPT, args.resume_from)
+        print(f"[STATUS] Model loaded from checkpoint: {args.resume_from}")
     else:
-        cfg = create_moegpt_a5000_optimized(vocab_size=tok.vocab_size)
-        print("[ARCHITECTURE] Using optimized single-MoE architecture")
-    
-    model = MoEGPT(cfg).cuda()
-    print("[STATUS] model created and moved to CUDA.")
+        # Create new model
+        if args.model_arch == "deepseek":
+            cfg = create_moegpt_deepseek_style(vocab_size=tok.vocab_size)
+            print("[ARCHITECTURE] Using DeepSeek-style: alternating MHA -> MoE blocks")
+        else:
+            cfg = create_moegpt_a5000_optimized(vocab_size=tok.vocab_size)
+            print("[ARCHITECTURE] Using optimized single-MoE architecture")
+        
+        model = MoEGPT(cfg).cuda()
+        print("[STATUS] New model created and moved to CUDA.")
 
     # Print model info
     total_params, breakdown = analyze_memory_usage(model, batch_size=args.batch_size, seq_length=CONTEXT_SIZE)
     
     print(f"\nARCHITECTURE SUMMARY:")
-    print(f"• Total blocks: {cfg.n_layer}")
+    print(f"• Total blocks: {model.config.n_layer}")
     print(f"• Each block: MHA -> MoE")
-    print(f"• Attention: {cfg.n_head} heads, {cfg.n_embd} dim")
-    print(f"• MoE per block: {cfg.num_experts} experts, {cfg.expert_dim} dim")
-    print(f"• Context: {cfg.block_size} tokens")
+    print(f"• Attention: {model.config.n_head} heads, {model.config.n_embd} dim")
+    print(f"• MoE per block: {model.config.num_experts} experts, {model.config.expert_dim} dim")
+    print(f"• Context: {model.config.block_size} tokens")
 
     # Train the model
-    train(model, dataset, batch_size=args.batch_size, epochs=args.epochs, lr=args.lr)
+    train(model, dataset, 
+          batch_size=args.batch_size, 
+          epochs=args.epochs, 
+          lr=args.lr,
+          checkpoint_dir=args.checkpoint_dir,
+          save_every=args.save_every,
+          resume_from=args.resume_from)
+
+    # Save final model
+    if args.save_final_model:
+        model_dir = "saved_models"
+        save_model(model, model_dir)
+        save_tokenizer(tok, model_dir)
+        print(f"Final model and tokenizer saved to {model_dir}")
 
     # Generate text with the trained model
-    output = inference(model, tok, "# finds target ilement in preliminary sorted array arr\n def binary_search(arr, target):\n", max_new_tokens=args.max_new_tokens)
-    print("Generated text:\n", output)
+    print("\n" + "="*50)
+    print("GENERATION EXAMPLES")
+    print("="*50)
+    
+    prompts = [
+        "def binary_search(arr, target):\n",
+        "def quicksort(arr):\n",
+        "def fibonacci(n):\n",
+        "class LinkedList:\n    def __init__(self):\n",
+    ]
+    
+    for prompt in prompts:
+        print(f"\n--- Generating for: {prompt.strip()} ---")
+        output = inference(model, tok, prompt, max_new_tokens=args.max_new_tokens)
+        print(output)
+        print("-" * 40)
+
+    # Also try multiple samples for the main prompt
+    print("\n--- Multiple samples for binary_search ---")
+    best_code, all_samples = generate_multiple_samples(
+        model, tok, 
+        "def binary_search(arr, target):\n",
+        num_samples=3
+    )
+    
+    print("\n--- BEST SAMPLE ---")
+    print(best_code)
