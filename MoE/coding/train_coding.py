@@ -178,80 +178,70 @@ class RotaryEmbedding(nn.Module):
             self._build_cache(max(seq_len, self.max_seq_len_cached + 1), device, dtype)
         return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
 
+
+import torch.backends.cuda as cuda
+cuda.enable_flash_sdp(True)  # Enable Flash Attention if available
+
 class MHA(nn.Module):
     def __init__(self, config: MoEGPTConfig):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         self.n_head = config.n_head
         self.head_dim = config.n_embd // config.n_head
-        self.scale = self.head_dim ** -0.5
+        self.n_embd = config.n_embd
 
-        # we use n_embed x n_embed because these are joint projections of qkv among all heads
-        self.key = nn.Linear(config.n_embd, config.n_embd, bias=False)
-        self.query = nn.Linear(config.n_embd, config.n_embd, bias=False)
-        self.value = nn.Linear(config.n_embd, config.n_embd, bias=False)
-
+        # Use fused QKV projection for better memory efficiency
+        self.qkv = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
         self.proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
         self.dropout = nn.Dropout(config.dropout)
 
-        # causal mask prepared once for maximum block size
-        self.register_buffer(
-            'mask',
-            torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size)
-        )
-
         self.use_rope = (getattr(config, "pos_encoding", "rope") == "rope")
         if self.use_rope:
-            self.rope = RotaryEmbedding(self.head_dim, base=config.rope_base, scale=config.rope_scale, max_seq_len=config.block_size)
+            self.rope = RotaryEmbedding(self.head_dim, base=config.rope_base, 
+                                      scale=config.rope_scale, max_seq_len=config.block_size)
 
     @staticmethod
     def _rotate_half(x):
-        # [..., dim] with dim even
         x1 = x[..., : x.shape[-1] // 2]
         x2 = x[..., x.shape[-1] // 2 :]
         return torch.cat((-x2, x1), dim=-1)
 
     def _apply_rope(self, q, k):
-        # q,k: [B, H, T, D]
+        # Same RoPE implementation as before
         B, H, T, D = q.shape
-        
-        # Get cos/sin with shape [T, D]
         cos, sin = self.rope.get_cos_sin(T, q.device, q.dtype)
-        
-        # Reshape cos/sin to [1, 1, T, D] for broadcasting with [B, H, T, D]
         cos = cos.view(1, 1, T, D)
         sin = sin.view(1, 1, T, D)
         
-        # Apply RoPE to queries and keys
         q_rotated = (q * cos) + (self._rotate_half(q) * sin)
         k_rotated = (k * cos) + (self._rotate_half(k) * sin)
-        
         return q_rotated, k_rotated
 
     def forward(self, x):
         B, T, C = x.shape
-
-        k = self.key(x)
-        q = self.query(x)
-        v = self.value(x)
-
-        # shape into heads
-        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, nh, T, hd)
-        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        
+        # Fused QKV projection
+        qkv = self.qkv(x).reshape(B, T, 3, self.n_head, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # (B, nh, T, hd)
 
         if self.use_rope:
             q, k = self._apply_rope(q, k)
 
-        att = (q @ k.transpose(-2, -1)) * self.scale  # (B, nh, T, T)
-        att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        att = self.dropout(att)
-        y = att @ v  # (B, nh, T, hd)
+        # Use PyTorch's built-in scaled_dot_product_attention (uses Flash Attention when available)
+        with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):
+            y = F.scaled_dot_product_attention(
+                q, k, v, 
+                attn_mask=None, 
+                dropout_p=self.dropout.p if self.training else 0,
+                is_causal=True
+            )
+        
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.proj(y)
         y = self.dropout(y)
         return y
+
+######################################
 
 class DenseFFN(nn.Module):
     def __init__(self, n_embd: int, dropout: float = 0.0):
@@ -386,14 +376,16 @@ class MoEGPT(nn.Module):
         return logits, loss, aux_total
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens: int):
-        for _ in range(max_new_tokens):
-            idx_cond = idx[:, -self.config.block_size:]
-            logits, _, _ = self.forward(idx_cond)
-            logits = logits[:, -1, :]
-            probs = F.softmax(logits, dim=-1)
-            next_id = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat([idx, next_id], dim=1)
+    def generate(self, idx, max_new_tokens: int, temperature=0.8):
+        # Use autocast in generation loop
+        with torch.cuda.amp.autocast(dtype=torch.float16):
+            for _ in range(max_new_tokens):
+                idx_cond = idx[:, -self.config.block_size:]
+                logits, _, _ = self.forward(idx_cond)
+                logits = logits[:, -1, :] / temperature
+                probs = F.softmax(logits, dim=-1)
+                next_id = torch.multinomial(probs, num_samples=1)
+                idx = torch.cat([idx, next_id], dim=1)
         return idx
 
 ########################################################################################################
@@ -451,51 +443,47 @@ def print_memory_stats(step_name=""):
     torch.cuda.reset_peak_memory_stats()  # Reset max counter
 
 
-def train(model, dataset, batch_size=64, epochs=3, lr=3e-4):
-    # Create streaming dataset
+def train(model, dataset, batch_size=16, epochs=3, lr=3e-4, grad_accum_steps=2):
     stream_dataset = StreamingDataset(dataset, tok, seq_length=CONTEXT_SIZE)
     
-    # Create DataLoader with multiple workers
-    dataloader = DataLoader(
-        stream_dataset, 
-        batch_size=batch_size,
-        shuffle=True
-        #num_workers=4,  # Parallel data loading
-        #pin_memory=True  # Faster transfer to GPU
-    )
+    dataloader = DataLoader(stream_dataset, batch_size=batch_size, shuffle=True)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    loss_fn = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1)
+    scaler = torch.cuda.amp.GradScaler()  # Mixed precision
     
     print("[STATUS] training started....")
     model.train()
-    t0 = time.time()
+    
     for epoch in range(1, epochs + 1):
-        xb, yb = get_batch_from_dataloader(dataloader)
-        xb = xb.to('cuda')
-        yb = yb.to('cuda')
-        if xb is None:  # Reset if dataset is exhausted
-            dataloader.dataset._fill_buffer()
-            continue
+        total_loss = 0
+        for step, batch in enumerate(dataloader):
+            xb = batch[:, :-1].to('cuda', non_blocking=True)
+            yb = batch[:, 1:].to('cuda', non_blocking=True)
 
-        logits, loss_ce, aux_loss = model(xb, yb)
-        loss = loss_ce + cfg.aux_loss_weight * aux_loss
+            with torch.cuda.amp.autocast():
+                logits, loss_ce, aux_loss = model(xb, yb)
+                loss = loss_ce + model.config.aux_loss_weight * aux_loss
+                loss = loss / grad_accum_steps
 
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+            scaler.scale(loss).backward()
 
-        if epoch % max(1, epochs // 10) == 0 or epoch == 1:
-            dt = time.time() - t0
-            print(f"epoch {epoch:5d}/{epochs} | loss {loss.item():.4f} (ce {loss_ce.item():.4f} + aux {aux_loss.item():.4f}) | {dt:.1f}s")
-            print_memory_stats()
+            if (step + 1) % grad_accum_steps == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
 
-    training_time = time.time() - t0
-    print(f"Training time: {training_time:.2f} seconds")
+            total_loss += loss.item() * grad_accum_steps
+
+            if step % 100 == 0:
+                print(f"epoch {epoch} | step {step} | loss {total_loss/(step+1):.4f}")
+
+        print(f"epoch {epoch} | avg_loss {total_loss/len(dataloader):.4f}")
 
 
 def inference(model, tok, prompt = "", max_new_tokens=100):
+    model = model.half()
     model.eval()
 
     # prepare empty context for now
@@ -510,9 +498,20 @@ def inference(model, tok, prompt = "", max_new_tokens=100):
 
     return generated
 
+def print_torch_stats():
+    # Check if FlashAttention is available in your PyTorch installation
+    print("FlashAttention available:", torch.backends.cuda.flash_sdp_enabled())
+
+    # List available backends
+    from torch.backends.cuda import SDPBackend
+    print("\nAvailable SDP backends:")
+    with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=True):
+        print("All backends enabled for context")
 
 # --- Main ---
 if __name__ == "__main__":
+    print_torch_stats()
+
     parser = argparse.ArgumentParser()
     # LLM settings
     parser.add_argument("--epochs", type=int, default=2000)
