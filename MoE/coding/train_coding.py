@@ -53,7 +53,7 @@ def create_moegpt_large(vocab_size: int, **kwargs) -> MoEGPTConfig:
     return MoEGPTConfig(
         vocab_size=vocab_size,
         n_layer=3, n_head=12, n_embd=768, block_size=CONTEXT_SIZE,
-        num_experts=16, expert_dim=2048,
+        num_experts=16, expert_dim=4096,
         **kwargs
     )
 
@@ -269,40 +269,6 @@ class Block(nn.Module):
         x = x + self.ff(self.ln2(x))
         return x, x.new_zeros(())  # zero aux
 
-class Router(nn.Module):
-    def __init__(self, config: MoEGPTConfig):
-        super().__init__()
-        self.fc = nn.Linear(config.n_embd, config.num_experts)  # Output size = num_experts
-
-    def forward(self, x):
-        # (B, T, C) -> (B, T, num_experts)
-        logits = self.fc(x)  # Raw logits to determine routing for each token
-        probs = F.softmax(logits, dim=-1)  # (B, T, num_experts)
-        return probs
-
-class TopKRouter(nn.Module):
-    def __init__(self, config: MoEGPTConfig):
-        super().__init__()
-        # Deeper routing network for better expert selection
-        self.net = nn.Sequential(
-            nn.Linear(config.n_embd, config.n_embd // 2),
-            nn.GELU(),
-            nn.Linear(config.n_embd // 2, config.num_experts)
-        )
-        
-    def forward(self, x):
-        logits = self.net(x)
-        # Use gumbel softmax for differentiable top-k
-        if self.training:
-            return F.gumbel_softmax(logits, tau=1.0, hard=True, dim=-1)
-        else:
-            # During inference, use top-2 experts
-            probs = F.softmax(logits, dim=-1)
-            top2_probs, top2_indices = torch.topk(probs, k=2, dim=-1)
-            # Renormalize
-            top2_probs = top2_probs / top2_probs.sum(dim=-1, keepdim=True)
-            return top2_probs, top2_indices        
-
 class MoEExpert(nn.Module):
     def __init__(self, config: MoEGPTConfig):
         super().__init__()
@@ -318,22 +284,62 @@ class MoEExpert(nn.Module):
 class MoELayer(nn.Module):
     def __init__(self, config: MoEGPTConfig):
         super().__init__()
-        self.router = Router(config)
+        self.config = config
+        self.router = nn.Linear(config.n_embd, config.num_experts, bias=False)
         self.experts = nn.ModuleList([MoEExpert(config) for _ in range(config.num_experts)])
+        self.top_k = 2
+        self.noise_epsilon = 1e-2
 
     def forward(self, x):
         B, T, C = x.shape
-        expert_probs = self.router(x)  # (B, T, num_experts)
-        expert_outputs = []
+        x_flat = x.reshape(B * T, C)
+        
+        # Router with noise for load balancing
+        router_logits = self.router(x_flat)
+        if self.training:
+            router_logits = router_logits + torch.randn_like(router_logits) * self.noise_epsilon
+        
+        # Get top-k experts - VECTORIZED
+        router_probs = F.softmax(router_logits, dim=-1)
+        topk_weights, topk_indices = torch.topk(router_probs, self.top_k, dim=-1)
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        
+        # Create expert masks - VECTORIZED
+        expert_mask = torch.zeros(B * T, self.config.num_experts, device=x.device)
+        expert_mask.scatter_(1, topk_indices, topk_weights)
+        
+        # Initialize output
+        output = torch.zeros_like(x_flat)
+        
+        # Process each expert in batch - VECTORIZED
+        for expert_idx, expert in enumerate(self.experts):
+            # Get tokens that use this expert
+            mask = expert_mask[:, expert_idx] > 0
+            if mask.any():
+                expert_input = x_flat[mask]
+                expert_output = expert(expert_input)
+                
+                # Apply weights - VECTORIZED
+                weights = expert_mask[mask, expert_idx].unsqueeze(-1)
+                output[mask] += weights * expert_output
+        
+        output = output.reshape(B, T, C)
+        
+        # Aux loss
+        aux_loss = self._compute_aux_loss(router_probs, topk_indices) if self.training else 0.0
+        
+        return output, aux_loss
 
-        # Use softmax probabilities to apply weighted expert outputs
-        for i, expert in enumerate(self.experts):
-            expert_output = expert(x)  # (B, T, C)
-            expert_outputs.append(expert_output * expert_probs[:, :, i:i+1])  # Weighted by probability
+    def _compute_aux_loss(self, router_probs, topk_indices):
+        # Expert usage statistics - VECTORIZED
+        expert_usage = torch.zeros(self.config.num_experts, device=router_probs.device)
+        for expert_idx in range(self.config.num_experts):
+            expert_usage[expert_idx] = (topk_indices == expert_idx).float().mean()
+        
+        target_usage = torch.ones_like(expert_usage) / self.config.num_experts
+        aux_loss = F.mse_loss(expert_usage, target_usage)
+        return aux_loss
 
-        # Aggregate the expert outputs (sum the weighted outputs)
-        moe_output = torch.stack(expert_outputs, dim=-1).sum(dim=-1)  # (B, T, C)
-        return moe_output
 
 class MoEGPT(nn.Module):
     def __init__(self, config: MoEGPTConfig):
@@ -359,13 +365,16 @@ class MoEGPT(nn.Module):
             x = x + self.pos_emb(pos)
 
         x = self.drop(x)
-        aux_total = x.new_zeros(())
+        aux_total = 0.0  # Initialize as float
         
         for mha_block in self.mha_blocks:
             x, aux = mha_block(x)
             aux_total = aux_total + aux
         
-        x = self.moe_layer(x)  # Apply MoE layer
+        # MoE layer now returns (output, aux_loss)
+        x, moe_aux = self.moe_layer(x)
+        aux_total = aux_total + moe_aux
+        
         x = self.ln_f(x)
         logits = self.head(x)
         
