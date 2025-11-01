@@ -145,27 +145,3 @@ def inference_from_saved(model_path, tokenizer_path, prompt="", max_new_tokens=1
         generated = tokenizer.decode(out)
     
     return generated
-
-def generate_multiple_samples(model, tok, prompt, num_samples=3, max_new_tokens=150, temperature=0.7):
-    """Generate multiple samples and pick the best one"""
-    samples = []
-    
-    for i in range(num_samples):
-        # Vary temperature slightly for diversity
-        current_temp = temperature * (0.8 + 0.4 * (i / num_samples))
-        sample = inference(model, tok, prompt, max_new_tokens, temperature=current_temp)
-        samples.append(sample)
-        
-        print(f"--- Sample {i+1} (temp={current_temp:.2f}) ---")
-        print(sample)
-        print()
-    
-    # Simple heuristic: pick the one with most complete function structure
-    best_sample = max(samples, key=lambda s: (
-        s.count('def '),
-        s.count('return '),
-        s.count(':') - s.count('":'),  # Count colons but not in strings
-        len(s)
-    ))
-    
-    return best_sample, samples
