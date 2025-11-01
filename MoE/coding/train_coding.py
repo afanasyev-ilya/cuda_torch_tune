@@ -57,6 +57,24 @@ def create_moegpt_large(vocab_size: int, **kwargs) -> MoEGPTConfig:
         **kwargs
     )
 
+def create_moegpt_a5000_optimized(vocab_size: int, **kwargs) -> MoEGPTConfig:
+    """Optimized configuration for RTX A5000 (24GB VRAM)"""
+    return MoEGPTConfig(
+        vocab_size=vocab_size,
+        # Optimized for Python coding: wider attention, deeper MoE
+        n_layer=8,           # Increased from 3
+        n_head=16,           # Increased from 12
+        n_embd=1024,         # Increased from 768
+        block_size=CONTEXT_SIZE,
+        # MoE scaling - this is where you get most bang for buck
+        num_experts=32,      # Increased from 16
+        expert_dim=2048,     # Reduced from 4096 for balance
+        dropout=0.1,
+        aux_loss_weight=0.01,
+        pos_encoding="rope",  # Keep RoPE for better long context
+        **kwargs
+    )
+
 ########################################################################################################
 
 from tokenizers import Tokenizer
@@ -436,20 +454,85 @@ def get_batch_from_dataloader(dataloader):
         return x, y
     return None, None
 
-def print_model_info(model):
-    # Print model parameter count and estimated size
-    param_count = sum(p.numel() for p in model.parameters())
-    estimated_size = param_count * 4 / (1024 ** 2)  # size in MB assuming float32 (4 bytes)
-    print(f"Model has {param_count:,} parameters.")
-    print(f"Estimated model size: {estimated_size:.2f} MB")
 
-
-def print_memory_stats(step_name=""):
-    print(f"\n--- Memory Stats {step_name} ---")
-    print(f"Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
-    print(f"Reserved: {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
-    print(f"Max Allocated: {torch.cuda.max_memory_allocated() / 1024**2:.2f} MB")
-    torch.cuda.reset_peak_memory_stats()  # Reset max counter
+def analyze_memory_usage(model, batch_size=16, seq_length=512):
+    """Analyze memory usage by layer and provide scaling recommendations"""
+    print("=" * 60)
+    print("MEMORY USAGE ANALYSIS")
+    print("=" * 60)
+    
+    total_params = 0
+    layer_breakdown = {}
+    
+    # Analyze embedding layer
+    emb_params = sum(p.numel() for p in model.tok_emb.parameters())
+    if model.pos_emb is not None:
+        emb_params += sum(p.numel() for p in model.pos_emb.parameters())
+    total_params += emb_params
+    layer_breakdown["Embedding"] = emb_params
+    print(f"Embedding layers: {emb_params:,} parameters")
+    
+    # Analyze MHA blocks
+    mha_params = 0
+    for i, block in enumerate(model.mha_blocks):
+        block_params = sum(p.numel() for p in block.parameters())
+        mha_params += block_params
+        layer_breakdown[f"MHA Block {i+1}"] = block_params
+        print(f"MHA Block {i+1}: {block_params:,} parameters")
+    
+    total_params += mha_params
+    print(f"Total MHA blocks: {mha_params:,} parameters")
+    
+    # Analyze MoE layer
+    moe_params = 0
+    # Router
+    router_params = sum(p.numel() for p in model.moe_layer.router.parameters())
+    moe_params += router_params
+    
+    # Experts
+    expert_params = 0
+    for i, expert in enumerate(model.moe_layer.experts):
+        exp_params = sum(p.numel() for p in expert.parameters())
+        expert_params += exp_params
+    moe_params += expert_params
+    
+    total_params += moe_params
+    layer_breakdown["MoE Layer"] = moe_params
+    print(f"MoE Layer - Router: {router_params:,} parameters")
+    print(f"MoE Layer - Experts: {expert_params:,} parameters")
+    print(f"MoE Layer - Total: {moe_params:,} parameters")
+    
+    # Final layers
+    final_params = sum(p.numel() for p in model.ln_f.parameters()) + sum(p.numel() for p in model.head.parameters())
+    total_params += final_params
+    layer_breakdown["Final Layers"] = final_params
+    print(f"Final layers: {final_params:,} parameters")
+    
+    print("-" * 60)
+    print(f"TOTAL MODEL: {total_params:,} parameters")
+    
+    # Memory calculations
+    param_memory_mb = total_params * 4 / (1024 ** 2)  # FP32
+    param_memory_mb_fp16 = total_params * 2 / (1024 ** 2)  # FP16
+    
+    # Activation memory estimation (rough)
+    activation_memory_mb = (batch_size * seq_length * model.config.n_embd * 10) / (1024 ** 2)  # Conservative estimate
+    
+    # Optimizer memory (AdamW: 2x for moments + 1x for params)
+    optimizer_memory_mb = param_memory_mb * 3
+    
+    total_training_memory_mb = param_memory_mb_fp16 + activation_memory_mb + optimizer_memory_mb
+    
+    print("\nMEMORY BREAKDOWN:")
+    print(f"Parameters (FP32): {param_memory_mb:.2f} MB")
+    print(f"Parameters (FP16): {param_memory_mb_fp16:.2f} MB")
+    print(f"Activations (est.): {activation_memory_mb:.2f} MB")
+    print(f"Optimizer (AdamW): {optimizer_memory_mb:.2f} MB")
+    print(f"TOTAL TRAINING: {total_training_memory_mb:.2f} MB")
+    print(f"RTX A5000 VRAM: 24,000 MB")
+    print(f"AVAILABLE HEADROOM: {24000 - total_training_memory_mb:.2f} MB")
+    
+    return total_params, layer_breakdown
 
 
 def train(model, dataset, batch_size=16, epochs=3, lr=3e-4, grad_accum_steps=2):
@@ -554,17 +637,17 @@ if __name__ == "__main__":
     print("[STATUS] tokenizer prepared.")
 
     # Load model
-    cfg = create_moegpt_large(vocab_size=tok.vocab_size)
+    cfg = create_moegpt_a5000_optimized(vocab_size=tok.vocab_size)
     model = MoEGPT(cfg).cuda()
     print("[STATUS] model created and moved to CUDA.")
 
     # Print model info
-    print_model_info(model)
+    analyze_memory_usage(model)
 
     # Train the model
     train(model, dataset, batch_size=args.batch_size, epochs=args.epochs, lr=args.lr)
 
     # Generate text with the trained model
-    output = inference(model, tok, "def binary_search(arr, target):\n", max_new_tokens=args.max_new_tokens)
+    output = inference(model, tok, "# finds target ilement in preliminary sorted array arr\n def binary_search(arr, target):\n", max_new_tokens=args.max_new_tokens)
     print("Generated text:\n", output)
 
