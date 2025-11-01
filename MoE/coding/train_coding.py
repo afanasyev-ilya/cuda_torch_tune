@@ -57,6 +57,24 @@ def create_moegpt_large(vocab_size: int, **kwargs) -> MoEGPTConfig:
         **kwargs
     )
 
+def create_moegpt_deepseek_style(vocab_size: int, **kwargs) -> MoEGPTConfig:
+    """DeepSeek-style alternating MHA -> MoE architecture"""
+    return MoEGPTConfig(
+        vocab_size=vocab_size,
+        # For DeepSeek style, n_layer means number of (MHA + MoE) blocks
+        n_layer=6,           # Total blocks: 12 MHA + 12 MoE layers
+        n_head=16,           
+        n_embd=1024,         
+        block_size=CONTEXT_SIZE,
+        # Each MoE layer gets these settings
+        num_experts=16,      # Slightly fewer experts per layer but more layers
+        expert_dim=2048,     
+        dropout=0.1,
+        aux_loss_weight=0.01,
+        pos_encoding="rope",
+        **kwargs
+    )
+
 def create_moegpt_a5000_optimized(vocab_size: int, **kwargs) -> MoEGPTConfig:
     """Optimized configuration for RTX A5000 (24GB VRAM)"""
     return MoEGPTConfig(
@@ -358,6 +376,24 @@ class MoELayer(nn.Module):
         aux_loss = F.mse_loss(expert_usage, target_usage)
         return aux_loss
 
+# NEW: DeepSeek-style alternating MHA -> MoE blocks
+class MHAThenMoEBlock(nn.Module):
+    """DeepSeek-style block: MHA followed by MoE (replaces dense FFN)"""
+    def __init__(self, config: MoEGPTConfig):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(config.n_embd)
+        self.ln2 = nn.LayerNorm(config.n_embd)
+        self.attn = MHA(config)
+        self.moe = MoELayer(config)  # Replace dense FFN with MoE
+
+    def forward(self, x):
+        # MHA part
+        x = x + self.attn(self.ln1(x))
+        # MoE part (replaces FFN)
+        moe_out, aux_loss = self.moe(self.ln2(x))
+        x = x + moe_out
+        return x, aux_loss
+
 
 class MoEGPT(nn.Module):
     def __init__(self, config: MoEGPTConfig):
@@ -369,9 +405,12 @@ class MoEGPT(nn.Module):
             self.pos_emb = nn.Embedding(config.block_size, config.n_embd)
         self.drop = nn.Dropout(config.dropout)
 
-        self.mha_blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer - 1)])
-        self.moe_layer = MoELayer(config)
-        self.ln_f = nn.LayerNorm(config.n_embd)  # Final layer norm
+        # NEW: Use alternating MHA -> MoE blocks (DeepSeek style)
+        self.blocks = nn.ModuleList([
+            MHAThenMoEBlock(config) for _ in range(config.n_layer)
+        ])
+        
+        self.ln_f = nn.LayerNorm(config.n_embd)
         self.head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
     def forward(self, idx, targets=None):
@@ -383,15 +422,12 @@ class MoEGPT(nn.Module):
             x = x + self.pos_emb(pos)
 
         x = self.drop(x)
-        aux_total = 0.0  # Initialize as float
+        aux_total = 0.0
         
-        for mha_block in self.mha_blocks:
-            x, aux = mha_block(x)
-            aux_total = aux_total + aux
-        
-        # MoE layer now returns (output, aux_loss)
-        x, moe_aux = self.moe_layer(x)
-        aux_total = aux_total + moe_aux
+        # NEW: Process all MHA->MoE blocks
+        for block in self.blocks:
+            x, aux_loss = block(x)
+            aux_total = aux_total + aux_loss
         
         x = self.ln_f(x)
         logits = self.head(x)
@@ -472,35 +508,16 @@ def analyze_memory_usage(model, batch_size=16, seq_length=512):
     layer_breakdown["Embedding"] = emb_params
     print(f"Embedding layers: {emb_params:,} parameters")
     
-    # Analyze MHA blocks
-    mha_params = 0
-    for i, block in enumerate(model.mha_blocks):
-        block_params = sum(p.numel() for p in block.parameters())
-        mha_params += block_params
-        layer_breakdown[f"MHA Block {i+1}"] = block_params
-        print(f"MHA Block {i+1}: {block_params:,} parameters")
+    # Analyze blocks (now MHA+MoE blocks)
+    block_params = 0
+    for i, block in enumerate(model.blocks):
+        block_param_count = sum(p.numel() for p in block.parameters())
+        block_params += block_param_count
+        layer_breakdown[f"Block {i+1} (MHA+MoE)"] = block_param_count
+        print(f"Block {i+1} (MHA+MoE): {block_param_count:,} parameters")
     
-    total_params += mha_params
-    print(f"Total MHA blocks: {mha_params:,} parameters")
-    
-    # Analyze MoE layer
-    moe_params = 0
-    # Router
-    router_params = sum(p.numel() for p in model.moe_layer.router.parameters())
-    moe_params += router_params
-    
-    # Experts
-    expert_params = 0
-    for i, expert in enumerate(model.moe_layer.experts):
-        exp_params = sum(p.numel() for p in expert.parameters())
-        expert_params += exp_params
-    moe_params += expert_params
-    
-    total_params += moe_params
-    layer_breakdown["MoE Layer"] = moe_params
-    print(f"MoE Layer - Router: {router_params:,} parameters")
-    print(f"MoE Layer - Experts: {expert_params:,} parameters")
-    print(f"MoE Layer - Total: {moe_params:,} parameters")
+    total_params += block_params
+    print(f"Total blocks: {block_params:,} parameters")
     
     # Final layers
     final_params = sum(p.numel() for p in model.ln_f.parameters()) + sum(p.numel() for p in model.head.parameters())
@@ -611,6 +628,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--max_new_tokens", type=int, default=1000)
     parser.add_argument("--pos_encoding", type=str, choices=["rope", "learned"], default="rope")
+    parser.add_argument("--model_arch", type=str, choices=["deepseek", "optimized"], default="deepseek")
     # tokenizer settings
     parser.add_argument("--tok_path", type=str, default="./tokenizer.json")  # load/save here
     parser.add_argument("--vocab_size", type=int, default=32000)             # for BPE training
@@ -636,13 +654,26 @@ if __name__ == "__main__":
         print(f"Saved tokenizer to {args.tok_path}")
     print("[STATUS] tokenizer prepared.")
 
-    # Load model
-    cfg = create_moegpt_a5000_optimized(vocab_size=tok.vocab_size)
+    # Load model based on architecture choice
+    if args.model_arch == "deepseek":
+        cfg = create_moegpt_deepseek_style(vocab_size=tok.vocab_size)
+        print("[ARCHITECTURE] Using DeepSeek-style: alternating MHA -> MoE blocks")
+    else:
+        cfg = create_moegpt_a5000_optimized(vocab_size=tok.vocab_size)
+        print("[ARCHITECTURE] Using optimized single-MoE architecture")
+    
     model = MoEGPT(cfg).cuda()
     print("[STATUS] model created and moved to CUDA.")
 
     # Print model info
-    analyze_memory_usage(model)
+    total_params, breakdown = analyze_memory_usage(model, batch_size=args.batch_size, seq_length=CONTEXT_SIZE)
+    
+    print(f"\nARCHITECTURE SUMMARY:")
+    print(f"• Total blocks: {cfg.n_layer}")
+    print(f"• Each block: MHA -> MoE")
+    print(f"• Attention: {cfg.n_head} heads, {cfg.n_embd} dim")
+    print(f"• MoE per block: {cfg.num_experts} experts, {cfg.expert_dim} dim")
+    print(f"• Context: {cfg.block_size} tokens")
 
     # Train the model
     train(model, dataset, batch_size=args.batch_size, epochs=args.epochs, lr=args.lr)
@@ -650,4 +681,3 @@ if __name__ == "__main__":
     # Generate text with the trained model
     output = inference(model, tok, "# finds target ilement in preliminary sorted array arr\n def binary_search(arr, target):\n", max_new_tokens=args.max_new_tokens)
     print("Generated text:\n", output)
-
