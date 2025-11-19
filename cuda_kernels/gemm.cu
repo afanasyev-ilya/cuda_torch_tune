@@ -511,10 +511,10 @@ constexpr int WMMA_K = 16;
 
 // Each block is a single warp (32 threads).
 // Each warp computes one 16x16 tile of C.
-__global__ void wmma_bf16_gemm_kernel(const __nv_bfloat16* __restrict__ A,
-                                      const __nv_bfloat16* __restrict__ B,
-                                      float* __restrict__ C,
-                                      int M, int N, int K)
+__global__ void wmma_bf16_naive_gemm_kernel(const __nv_bfloat16* __restrict__ A,
+                                            const __nv_bfloat16* __restrict__ B,
+                                            float* __restrict__ C,
+                                            int M, int N, int K)
 {
     // Tile indices (in units of 16x16)
     int tile_m = blockIdx.y;
@@ -551,13 +551,50 @@ __global__ void wmma_bf16_gemm_kernel(const __nv_bfloat16* __restrict__ A,
     wmma::store_matrix_sync(tileC, c_frag, N, wmma::mem_row_major);
 }
 
-
 // Host wrapper for WMMA BF16 GEMM
+using KernelFunc = void(*)(const __nv_bfloat16*,
+                           const __nv_bfloat16*,
+                           float*,
+                           int,int,int);
+
+void cublas_fp32_ref_gemm(
+    cublasHandle_t handle,
+    int M, int N, int K,
+    const float* dA,  // row-major A[M,K]
+    const float* dB,  // row-major B[K,N]
+    float* dC_ref)    // row-major C[M,N]
+{
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;
+
+    int m = N;
+    int n = M;
+    int k = K;
+    int lda = N;
+    int ldb = K;
+    int ldc = N;
+
+    CHECK_CUBLAS(cublasSgemm(
+        handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        m, n, k,
+        &alpha,
+        dB, lda,
+        dA, ldb,
+        &beta,
+        dC_ref, ldc));
+}
+
+template <KernelFunc Kernel>
 void run_wmma_bf16_gemm(int M, int N, int K,
                         const float* dA_f32,
                         const float* dB_f32,
                         float* dC_f32,
-                        int iters)
+                        int iters,
+                        dim3 blockDim,
+                        dim3 gridDim,
+                        cublasHandle_t handle,
+                        std::string name)
 {
     // Require multiples of 16 for this simple demo
     if (M % WMMA_M != 0 || N % WMMA_N != 0 || K % WMMA_K != 0) {
@@ -567,36 +604,83 @@ void run_wmma_bf16_gemm(int M, int N, int K,
 
     int64_t sizeA = int64_t(M) * K;
     int64_t sizeB = int64_t(K) * N;
+    int64_t sizeC = int64_t(M) * N;
 
+    // Allocate BF16 buffers
     __nv_bfloat16* dA_bf16 = nullptr;
     __nv_bfloat16* dB_bf16 = nullptr;
     CHECK_CUDA(cudaMalloc(&dA_bf16, sizeA * sizeof(__nv_bfloat16)));
     CHECK_CUDA(cudaMalloc(&dB_bf16, sizeB * sizeof(__nv_bfloat16)));
 
     // Convert A, B to BF16
-    int threads = 256;
-    int blocksA = (int)((sizeA + threads - 1) / threads);
-    int blocksB = (int)((sizeB + threads - 1) / threads);
+    int convert_threads = 256;
+    int convert_blocksA = int((sizeA - 1) / convert_threads + 1);
+    int convert_blocksB = int((sizeB - 1) / convert_threads + 1);
 
-    convert_f32_to_nvbf16_kernel<<<blocksA, threads>>>(dA_f32, dA_bf16, (int)sizeA);
-    convert_f32_to_nvbf16_kernel<<<blocksB, threads>>>(dB_f32, dB_bf16, (int)sizeB);
+    convert_f32_to_nvbf16_kernel<<<convert_blocksA, convert_threads>>>(dA_f32, dA_bf16, int(sizeA));
+    convert_f32_to_nvbf16_kernel<<<convert_blocksB, convert_threads>>>(dB_f32, dB_bf16, int(sizeB));
     CHECK_CUDA(cudaDeviceSynchronize());
 
-    dim3 blockDim(32, 1, 1);  // 1 warp per block
-    dim3 gridDim(N / WMMA_N, M / WMMA_M, 1);
-
-    // Warm-up
-    wmma_bf16_gemm_kernel<<<gridDim, blockDim>>>(dA_bf16, dB_bf16, dC_f32, M, N, K);
+    // ---------------- Warm-up ----------------
+    Kernel<<<gridDim, blockDim>>>(dA_bf16, dB_bf16, dC_f32, M, N, K);
     CHECK_CUDA(cudaDeviceSynchronize());
 
-    // Timing
+    // ---------------- Verification ----------------
+    {
+        // Compute reference FP32 GEMM with cuBLAS
+        float* dC_ref = nullptr;
+        CHECK_CUDA(cudaMalloc(&dC_ref, sizeC * sizeof(float)));
+        CHECK_CUDA(cudaMemset(dC_ref, 0, sizeC * sizeof(float)));
+
+        cublas_fp32_ref_gemm(handle, M, N, K, dA_f32, dB_f32, dC_ref);
+        CHECK_CUDA(cudaDeviceSynchronize());
+
+        // Copy both results back to host
+        std::vector<float> hC(sizeC);
+        std::vector<float> hC_ref(sizeC);
+
+        CHECK_CUDA(cudaMemcpy(hC.data(),     dC_f32, sizeC * sizeof(float), cudaMemcpyDeviceToHost));
+        CHECK_CUDA(cudaMemcpy(hC_ref.data(), dC_ref, sizeC * sizeof(float), cudaMemcpyDeviceToHost));
+
+        CHECK_CUDA(cudaFree(dC_ref));
+
+        double max_abs = 0.0;
+        double max_rel = 0.0;
+        const int max_print_count = 0;
+        for (int64_t i = 0; i < sizeC; ++i) {
+            double ref = hC_ref[i];
+            double val = hC[i];
+            double diff = std::abs(val - ref);
+            double rel  = (std::abs(ref) > 0.0) ? diff / std::abs(ref) : diff;
+
+            if(i < max_print_count) {
+                std::cout << ref << " vs " << val << std::endl;
+            }
+
+            max_abs = std::max(diff, max_abs);
+            max_rel = std::max(rel, max_rel);
+    
+        }
+
+        std::cout << "check: max_abs = " << max_abs
+                  << ", max_rel = " << max_rel;
+
+        double tol = 0.1;  // BF16-level accuracy, adjust if you like
+        if (max_rel < tol) {
+            std::cout << "  (OK)" << std::endl;
+        } else {
+            std::cout << "  (WARN)" << std::endl;
+        }
+    }
+
+    // ---------------- Timing ----------------
     cudaEvent_t start, stop;
     CHECK_CUDA(cudaEventCreate(&start));
     CHECK_CUDA(cudaEventCreate(&stop));
 
     CHECK_CUDA(cudaEventRecord(start));
     for (int i = 0; i < iters; ++i) {
-        wmma_bf16_gemm_kernel<<<gridDim, blockDim>>>(dA_bf16, dB_bf16, dC_f32, M, N, K);
+        Kernel<<<gridDim, blockDim>>>(dA_bf16, dB_bf16, dC_f32, M, N, K);
     }
     CHECK_CUDA(cudaEventRecord(stop));
     CHECK_CUDA(cudaEventSynchronize(stop));
@@ -614,7 +698,7 @@ void run_wmma_bf16_gemm(int M, int N, int K,
     double flops  = 2.0 * double(M) * double(N) * double(K);
     double tflops = flops / (avg_ms * 1e-3) / 1e12;
 
-    std::cout << "[WMMA BF16 TC]  avg time: " << avg_ms
+    std::cout << "[" << name << "]   avg time: " << avg_ms
               << " ms,  TFLOP/s: " << tflops << std::endl;
 }
 
@@ -668,7 +752,7 @@ int main(int argc, char** argv)
     cublasHandle_t handle;
     CHECK_CUBLAS(cublasCreate(&handle));
 
-    std::cout << "----------------------------------------\n";
+    std::cout << "\n -------------- FP32 tests -------------- \n";
     run_cublas_gemm(handle, M, N, K, dA, dB, dC, iters);
 
     CHECK_CUDA(cudaMemset(dC, 0, bytesC));
@@ -677,11 +761,16 @@ int main(int argc, char** argv)
     CHECK_CUDA(cudaMemset(dC, 0, bytesC));
     run_cutlass_gemm(M, N, K, dA, dB, dC, iters);
 
+    std::cout << "\n -------------- BF16 tests -------------- \n";
+
     CHECK_CUDA(cudaMemset(dC, 0, bytesC));
     run_cublas_bf16_tc_gemm(handle, M, N, K, dA, dB, dC, iters);
 
     CHECK_CUDA(cudaMemset(dC, 0, bytesC));
-    run_wmma_bf16_gemm(M, N, K, dA, dB, dC, iters);
+    dim3 naive_block(32, 1, 1);
+    dim3 naive_grid((N - 1)/WMMA_N + 1, 
+                   (M - 1)/WMMA_M + 1);
+    run_wmma_bf16_gemm<wmma_bf16_naive_gemm_kernel>(M, N, K, dA, dB, dC, iters, naive_block, naive_grid, handle, "WMMA naive");
 
     CHECK_CUBLAS(cublasDestroy(handle));
 
