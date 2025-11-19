@@ -76,7 +76,7 @@
 
 #define TILE_M 128
 #define TILE_K 16
-#define TILE_N 96
+#define TILE_N 128
 
 #define BX 16
 #define BY 16
@@ -402,19 +402,12 @@ void run_cutlass_gemm(
 int main(int argc, char** argv)
 {
     int size_sq = 4096;
+    if (argc > 1)
+        size_sq = std::atoi(argv[1]);
     int M = size_sq;
     int N = size_sq;
     int K = size_sq;
     int iters = 10;
-
-    if (argc > 1)
-        M = std::atoi(argv[1]);
-    if (argc > 2)
-        N = std::atoi(argv[2]);
-    if (argc > 3)
-        K = std::atoi(argv[3]);
-    if (argc > 4)
-        iters = std::atoi(argv[4]);
 
     std::cout << "GEMM benchmark: C = A * B (row-major FP32)\n";
     std::cout << "  M = " << M << ", N = " << N << ", K = " << K
