@@ -578,7 +578,7 @@ def train(model, dataset, batch_size=16, epochs=3, lr=3e-4, grad_accum_steps=2,
         print(f"epoch {epoch:3d}/{epochs} | avg_loss {avg_epoch_loss:.4f}")
         
         # Save checkpoint
-        if epoch % save_every == 0 or epoch == epochs:
+        if epoch % save_every == 5 or epoch == epochs:
             save_checkpoint(model, optimizer, epoch, avg_epoch_loss, checkpoint_dir)
             
         # Save best model
