@@ -748,6 +748,103 @@ __global__ void wmma_bf16_cta(const __nv_bfloat16* __restrict__ A,
     wmma::store_matrix_sync(tileC, c_frag, N, wmma::mem_row_major);
 }
 
+#define WARP_SIZE 32
+
+__global__ void wmma_bf16_shared(const __nv_bfloat16* __restrict__ A,
+                                 const __nv_bfloat16* __restrict__ B,
+                                 float* __restrict__ C,
+                                 int M, int N, int K) {
+
+    int tid = threadIdx.x;
+    int warp_idx = tid / WARP_SIZE;
+
+    // 32 threads among x sit inside each warp, and we use Y/Z dims for tiling 
+    int warp_tile_m = warp_idx % 4;
+    int warp_tile_n = warp_idx / 4;
+
+    constexpr int BLOCK_M = 4 * WMMA_M;
+    constexpr int BLOCK_N = 4 * WMMA_N;
+    constexpr int BLOCK_K = WMMA_K;
+
+    // starting row and col of tile
+    int block_row = blockIdx.x * BLOCK_M;
+    int block_col = blockIdx.y * BLOCK_N;
+
+    int row = block_row + warp_tile_m * WMMA_M;
+    int col = block_col + warp_tile_n * WMMA_N;
+
+    if (row >= M || col >= N)
+        return;
+
+    __shared__ __nv_bfloat16 As[BLOCK_M][BLOCK_K];
+    __shared__ __nv_bfloat16 Bs[BLOCK_K][BLOCK_N];
+
+    // Fragments:
+    // A, B as BF16, C as FP32 accumulator
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> b_frag;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+
+    wmma::fill_fragment(c_frag, 0.0f);
+
+    const int block_size = blockDim.x;
+
+    // Loop over K dimension in tiles of 16
+    for (int k0 = 0; k0 < K; k0 += BLOCK_K) {
+        // copy to As
+        for(int idx = tid; idx < BLOCK_M*BLOCK_K; idx += block_size) {
+            int local_m = idx / BLOCK_K;
+            int local_k = idx % BLOCK_K;
+            int lda = K;
+            int global_k = (k0 + local_k);
+            int global_m = block_row + local_m;
+
+            __nv_bfloat16 val = __float2bfloat16(0.0f);
+
+            if(global_m < M && global_k < K) {
+                val = A[global_m * lda + global_k];
+            }
+            As[local_m][local_k] = val;   
+        }
+
+        // copy to Bs
+        for(int idx = tid; idx < BLOCK_K*BLOCK_N; idx += block_size) {
+            int local_k = idx / BLOCK_N;
+            int local_n = idx % BLOCK_N;
+            int ldb = N;
+            int global_k = (k0 + local_k);
+            int global_n = block_col + local_n;
+
+            __nv_bfloat16 val = __float2bfloat16(0.0f);
+
+            if(global_n < N && global_k < K) {
+                val = B[global_k * ldb + global_n];
+            }
+            Bs[local_k][local_n] = val;   
+        }
+
+        __syncthreads();
+
+        const __nv_bfloat16* tileA = &As[WMMA_M * warp_tile_m][0];
+        const __nv_bfloat16* tileB = &Bs[0][WMMA_N * warp_tile_n];
+
+        int lda_shared = BLOCK_K;
+        int ldb_shared = BLOCK_N;
+
+        // Load 16x16 tiles from row-major storage
+        wmma::load_matrix_sync(a_frag, tileA, lda_shared);
+        wmma::load_matrix_sync(b_frag, tileB, ldb_shared);
+
+        // C_tile += A_tile * B_tile
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+
+        __syncthreads();
+    }
+
+    float* tileC = &C[row * N + col];
+    wmma::store_matrix_sync(tileC, c_frag, N, wmma::mem_row_major);
+}
+
 // ---------------------------------------------------- Main ----------------------------------------------------
 
 int main(int argc, char** argv)
@@ -821,6 +918,11 @@ int main(int argc, char** argv)
     dim3 cta_block(32, 4, 4);
     dim3 cta_grid(1, (M - 1)/(WMMA_M*4) + 1, (N - 1)/(WMMA_N*4) + 1);
     run_wmma_bf16_gemm<wmma_bf16_cta>(M, N, K, dA, dB, dC, iters, cta_block, cta_grid, handle, "WMMA CTA");
+
+    CHECK_CUDA(cudaMemset(dC, 0, bytesC));
+    dim3 shared_block(512, 1, 1);
+    dim3 shared_grid((M - 1)/(WMMA_M*4) + 1, (N - 1)/(WMMA_N*4) + 1);
+    run_wmma_bf16_gemm<wmma_bf16_shared>(M, N, K, dA, dB, dC, iters, shared_block, shared_grid, handle, "WMMA shared");
 
     CHECK_CUBLAS(cublasDestroy(handle));
 
