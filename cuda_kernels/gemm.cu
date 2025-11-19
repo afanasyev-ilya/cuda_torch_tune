@@ -509,95 +509,6 @@ constexpr int WMMA_M = 16;
 constexpr int WMMA_N = 16;
 constexpr int WMMA_K = 16;
 
-// Each block is a single warp (32 threads).
-// Each warp computes one 16x16 tile of C.
-__global__ void wmma_bf16_naive_gemm_kernel(const __nv_bfloat16* __restrict__ A,
-                                            const __nv_bfloat16* __restrict__ B,
-                                            float* __restrict__ C,
-                                            int M, int N, int K)
-{
-    // Tile indices (in units of 16x16)
-    int tile_n = blockIdx.y;
-
-    int tile_m = blockIdx.x;
-
-    int row = tile_m * WMMA_M;
-    int col = tile_n * WMMA_N;
-
-    if (row >= M || col >= N) return;
-
-    // Fragments:
-    // A, B as BF16, C as FP32 accumulator
-    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> a_frag;
-    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> b_frag;
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
-
-    wmma::fill_fragment(c_frag, 0.0f);
-
-    // Loop over K dimension in tiles of 16
-    for (int k = 0; k < K; k += WMMA_K) {
-        const __nv_bfloat16* tileA = A + row * K + k;  // A[row:row+16, k:k+16]
-        const __nv_bfloat16* tileB = B + k * N + col;  // B[k:k+16, col:col+16]
-
-        // Load 16x16 tiles from row-major storage
-        wmma::load_matrix_sync(a_frag, tileA, K);
-        wmma::load_matrix_sync(b_frag, tileB, N);
-
-        // C_tile += A_tile * B_tile
-        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-    }
-
-    // Store result tile back to C (row-major)
-    float* tileC = C + row * N + col;
-    wmma::store_matrix_sync(tileC, c_frag, N, wmma::mem_row_major);
-}
-
-__global__ void wmma_bf16_cta(const __nv_bfloat16* __restrict__ A,
-                              const __nv_bfloat16* __restrict__ B,
-                              float* __restrict__ C,
-                              int M, int N, int K)
-{
-    // 32 threads among x sit inside each warp, and we use Y/Z dims for tiling 
-    int warp_tile_m = threadIdx.y;
-    int warp_tile_n = threadIdx.z;
-
-    // global coord of tile among m and n matrix dims
-    int tile_m = blockIdx.y * blockDim.y + warp_tile_m;
-    int tile_n = blockIdx.z * blockDim.z + warp_tile_n;
-
-    // starting row and col of tile
-    int row = tile_m * WMMA_M;
-    int col = tile_n * WMMA_N;
-
-    if (row >= M || col >= N)
-        return;
-
-    // Fragments:
-    // A, B as BF16, C as FP32 accumulator
-    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> a_frag;
-    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> b_frag;
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
-
-    wmma::fill_fragment(c_frag, 0.0f);
-
-    // Loop over K dimension in tiles of 16
-    for (int k = 0; k < K; k += WMMA_K) {
-        const __nv_bfloat16* tileA = A + row * K + k;  // A[row:row+16, k:k+16]
-        const __nv_bfloat16* tileB = B + k * N + col;  // B[k:k+16, col:col+16]
-
-        // Load 16x16 tiles from row-major storage
-        wmma::load_matrix_sync(a_frag, tileA, K);
-        wmma::load_matrix_sync(b_frag, tileB, N);
-
-        // C_tile += A_tile * B_tile
-        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-    }
-
-    // Store result tile back to C (row-major)
-    float* tileC = C + row * N + col;
-    wmma::store_matrix_sync(tileC, c_frag, N, wmma::mem_row_major);
-}
-
 // Host wrapper for WMMA BF16 GEMM
 using KernelFunc = void(*)(const __nv_bfloat16*,
                            const __nv_bfloat16*,
@@ -745,6 +656,96 @@ void run_wmma_bf16_gemm(int M, int N, int K,
 
     std::cout << "[" << name << "]   avg time: " << avg_ms
               << " ms,  TFLOP/s: " << tflops << std::endl;
+}
+
+
+// Each block is a single warp (32 threads).
+// Each warp computes one 16x16 tile of C.
+__global__ void wmma_bf16_naive_gemm_kernel(const __nv_bfloat16* __restrict__ A,
+                                            const __nv_bfloat16* __restrict__ B,
+                                            float* __restrict__ C,
+                                            int M, int N, int K)
+{
+    // Tile indices (in units of 16x16)
+    int tile_n = blockIdx.y;
+
+    int tile_m = blockIdx.x;
+
+    int row = tile_m * WMMA_M;
+    int col = tile_n * WMMA_N;
+
+    if (row >= M || col >= N) return;
+
+    // Fragments:
+    // A, B as BF16, C as FP32 accumulator
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> b_frag;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+
+    wmma::fill_fragment(c_frag, 0.0f);
+
+    // Loop over K dimension in tiles of 16
+    for (int k = 0; k < K; k += WMMA_K) {
+        const __nv_bfloat16* tileA = A + row * K + k;  // A[row:row+16, k:k+16]
+        const __nv_bfloat16* tileB = B + k * N + col;  // B[k:k+16, col:col+16]
+
+        // Load 16x16 tiles from row-major storage
+        wmma::load_matrix_sync(a_frag, tileA, K);
+        wmma::load_matrix_sync(b_frag, tileB, N);
+
+        // C_tile += A_tile * B_tile
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+    }
+
+    // Store result tile back to C (row-major)
+    float* tileC = C + row * N + col;
+    wmma::store_matrix_sync(tileC, c_frag, N, wmma::mem_row_major);
+}
+
+__global__ void wmma_bf16_cta(const __nv_bfloat16* __restrict__ A,
+                              const __nv_bfloat16* __restrict__ B,
+                              float* __restrict__ C,
+                              int M, int N, int K)
+{
+    // 32 threads among x sit inside each warp, and we use Y/Z dims for tiling 
+    int warp_tile_m = threadIdx.y;
+    int warp_tile_n = threadIdx.z;
+
+    // global coord of tile among m and n matrix dims
+    int tile_m = blockIdx.y * blockDim.y + warp_tile_m;
+    int tile_n = blockIdx.z * blockDim.z + warp_tile_n;
+
+    // starting row and col of tile
+    int row = tile_m * WMMA_M;
+    int col = tile_n * WMMA_N;
+
+    if (row >= M || col >= N)
+        return;
+
+    // Fragments:
+    // A, B as BF16, C as FP32 accumulator
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> b_frag;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+
+    wmma::fill_fragment(c_frag, 0.0f);
+
+    // Loop over K dimension in tiles of 16
+    for (int k = 0; k < K; k += WMMA_K) {
+        const __nv_bfloat16* tileA = A + row * K + k;  // A[row:row+16, k:k+16]
+        const __nv_bfloat16* tileB = B + k * N + col;  // B[k:k+16, col:col+16]
+
+        // Load 16x16 tiles from row-major storage
+        wmma::load_matrix_sync(a_frag, tileA, K);
+        wmma::load_matrix_sync(b_frag, tileB, N);
+
+        // C_tile += A_tile * B_tile
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+    }
+
+    // Store result tile back to C (row-major)
+    float* tileC = C + row * N + col;
+    wmma::store_matrix_sync(tileC, c_frag, N, wmma::mem_row_major);
 }
 
 // ---------------------------------------------------- Main ----------------------------------------------------
