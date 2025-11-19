@@ -56,6 +56,23 @@
         "streambuf": "cpp",
         "thread": "cpp",
         "cinttypes": "cpp",
-        "typeinfo": "cpp"
-    }
+        "typeinfo": "cpp",
+        "*.cu": "cuda-cpp"
+    },
+
+    "[cpp]": {
+        "editor.defaultFormatter": "ms-vscode.cpptools",
+        "editor.tabSize": 4,
+        "editor.insertSpaces": true
+    },
+
+    "[cuda-cpp]": {
+        "editor.defaultFormatter": "ms-vscode.cpptools",
+        "editor.tabSize": 4,
+        "editor.insertSpaces": true
+    },
+
+    "C_Cpp.formatting": "vcFormat",
+    "C_Cpp.vcFormat.indentWidth": 4
 }
+
