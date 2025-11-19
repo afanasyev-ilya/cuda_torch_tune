@@ -30,6 +30,9 @@
 #include "cutlass/gemm/device/gemm.h"
 #include "cutlass/layout/matrix.h"
 #include "cutlass/arch/arch.h"
+#include "cutlass/gemm/thread/mma.h"
+#include "cutlass/gemm/gemm.h"       // for GemmShape
+#include "cutlass/array.h"           // for cutlass::Array (fragments)
 
 // ----------------- Helpers & macros -----------------
 
@@ -69,42 +72,129 @@
   } while (0)
 
 
-// ----------------- Naive CUDA GEMM -----------------
+// ----------------- Custom CUDA GEMM -----------------
 
-// Row-major: A[M,K], B[K,N], C[M,N]
-__global__ void naive_gemm_kernel(
-    int M, int N, int K,
-    const float* __restrict__ A,
-    const float* __restrict__ B,
-    float* __restrict__ C)
-{
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
+#define TILE_M 128
+#define TILE_K 16
+#define TILE_N 96
 
-    if (row >= M || col >= N)
-        return;
+#define BX 16
+#define BY 16
 
-    float acc = 0.0f;
-    for (int k = 0; k < K; ++k)
-    {
-        float a = A[row * K + k];
-        float b = B[k * N + col];
-        acc += a * b;
+#define MICRO_M (TILE_M/BX) // 
+#define MICRO_N (TILE_N/BY) // changing 8 -> 6 gave +1.5 tflop
+
+static_assert(BX == TILE_N / MICRO_N, "BX must me = TILE_N / MICRO_N");
+static_assert(BY == TILE_M / MICRO_M, "BY must me = TILE_M / MICRO_M");
+
+template <typename scalar_t>
+__global__ __launch_bounds__(BX*BY, 2)
+__global__ void opt_matmul_kernel(const scalar_t* __restrict__ A,
+                                  const scalar_t* __restrict__ B,
+                                  scalar_t* __restrict__ C,
+                                  const int M_size,
+                                  const int N_size, 
+                                  const int K_size) {
+    
+    // Calculate global thread index within the batch dimension
+    int lda = K_size;
+    int ldb = N_size;
+    int ldc = N_size;
+
+    __shared__ float A_shared[TILE_M][TILE_K + 1];
+    __shared__ float B_shared[TILE_K][TILE_N + 1];
+
+    int tid = threadIdx.x + blockDim.x * threadIdx.y;
+    int block_size = blockDim.x * blockDim.y;
+
+    float C_reg[MICRO_M][MICRO_N];
+    #pragma unroll
+    for(int i = 0; i < MICRO_M; i++) 
+        #pragma unroll
+        for(int j = 0; j < MICRO_N; j++)
+            C_reg[i][j] = 0.0;
+    
+    for(int k_start = 0; k_start < K_size; k_start += TILE_K) {
+        // load A tile
+        #pragma unroll
+        for(int i = tid; i < TILE_M * TILE_K; i += block_size) {
+            int local_row = i / TILE_K;
+            int local_col = i % TILE_K;
+            int global_col = k_start + local_col;
+            int global_row = TILE_M * blockIdx.y + local_row;
+            int a_idx = global_col + global_row * lda;
+            float val = 0;
+            if(global_col < K_size && global_row < M_size)
+                val = A[a_idx];
+            A_shared[local_row][local_col] = val;
+        }
+
+        // load B tile
+        #pragma unroll
+        for(int i = tid; i < TILE_N * TILE_K; i += block_size) {
+            int local_row = i / TILE_N;
+            int local_col = i % TILE_N;
+            int global_col = TILE_N * blockIdx.x + local_col;
+            int global_row = k_start + local_row;
+            int b_idx = global_col + global_row * ldb;
+            float val = 0;
+            if(global_col < N_size && global_row < K_size)
+                val = B[b_idx];
+            B_shared[local_row][local_col] = val;
+        }
+
+        __syncthreads();
+
+        #pragma unroll
+        for(int k = 0; k < TILE_K; k++) {
+            float a_reg[MICRO_M];
+            float b_reg[MICRO_N];
+
+            #pragma unroll
+            for(int i = 0; i < MICRO_M; i++) { // this is first part of column of A (for first tile)
+                a_reg[i] = A_shared[i + MICRO_M * threadIdx.y][k];
+            }
+
+            #pragma unroll
+            for(int i = 0; i < MICRO_N; i++) { // this is first part of row of B (for first tile)
+                b_reg[i] = B_shared[k][i + MICRO_N * threadIdx.x];
+            }
+
+            #pragma unroll
+            for(int i = 0; i < MICRO_M; i++) {
+                for(int j = 0; j < MICRO_N; j++) {
+                    C_reg[i][j] += a_reg[i] * b_reg[j];
+                }
+            }
+        }
+
+        __syncthreads();
     }
-    C[row * N + col] = acc;
+
+    #pragma unroll
+    for(int i = 0; i < MICRO_M; i++) {
+        #pragma unroll
+        for(int j = 0; j < MICRO_N; j++) {
+            int c_row = MICRO_M * threadIdx.y + blockIdx.y * TILE_M + i;
+            int c_col = MICRO_N * threadIdx.x + blockIdx.x * TILE_N + j;
+            int c_idx = c_col + ldc * c_row;
+            if(c_col < N_size && c_row < M_size)
+                C[c_idx] = C_reg[i][j];
+        }
+    }
 }
 
-void run_naive_gemm(
+void run_custom_gemm(
     int M, int N, int K,
     const float* dA, const float* dB, float* dC,
     int iters)
 {
-    dim3 blockDim(16, 16);
-    dim3 gridDim((N + blockDim.x - 1) / blockDim.x,
-        (M + blockDim.y - 1) / blockDim.y);
+    dim3 block_size(BX, BY, 1);
+    dim3 grid_size((N - 1) / (BX * MICRO_N) + 1, 
+                   (M - 1) / (BY * MICRO_M) + 1);
 
     // Warm-up
-    naive_gemm_kernel << <gridDim, blockDim >> > (M, N, K, dA, dB, dC);
+    opt_matmul_kernel<float> <<<grid_size, block_size>>> (dA, dB, dC, M, N, K);
     CHECK_CUDA(cudaDeviceSynchronize());
 
     // Timing
@@ -115,7 +205,7 @@ void run_naive_gemm(
     CHECK_CUDA(cudaEventRecord(start));
     for (int i = 0; i < iters; ++i)
     {
-        naive_gemm_kernel << <gridDim, blockDim >> > (M, N, K, dA, dB, dC);
+        opt_matmul_kernel<float> <<<grid_size, block_size>>> (dA, dB, dC, M, N, K);
     }
     CHECK_CUDA(cudaEventRecord(stop));
     CHECK_CUDA(cudaEventSynchronize(stop));
@@ -368,7 +458,7 @@ int main(int argc, char** argv)
     run_cublas_gemm(handle, M, N, K, dA, dB, dC, iters);
 
     CHECK_CUDA(cudaMemset(dC, 0, bytesC));
-    run_naive_gemm(M, N, K, dA, dB, dC, iters);
+    run_custom_gemm(M, N, K, dA, dB, dC, iters);
 
     CHECK_CUDA(cudaMemset(dC, 0, bytesC));
     run_cutlass_gemm(M, N, K, dA, dB, dC, iters);
