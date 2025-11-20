@@ -255,8 +255,8 @@ __global__ void sgemm_naive(const float *A,
                             float *C, 
                             int M, int N, int K,
                             float alpha, float beta) {
-    const uint x = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
 
     if (x >= M || y >= N)
         return;
@@ -270,25 +270,65 @@ __global__ void sgemm_naive(const float *A,
     C[x * N + y] = alpha * tmp + beta * C[x * N + y];
 }
 
+// ---------------------------------------
+
 __global__ void sgemm_coalcesed(const float *A,
                                 const float *B, 
                                 float *C, 
                                 int M, int N, int K,
                                 float alpha, float beta) {
-    const uint x = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y * blockDim.y + threadIdx.y;
 
-    if (x >= M || y >= N)
+    if (col >= N || row >= M)
         return;
     
     float tmp = 0.0;
 
     for (int i = 0; i < K; ++i) {
         // we improved memory access patter here, 
-        tmp += A[y * K + i] * B[i * N + x];
+        tmp += A[row * K + i] * B[i * N + col];
     }
 
-    C[y * N + x] = alpha * tmp + beta * C[y * N + x];
+    C[row * N + col] = alpha * tmp + beta * C[row * N + col];
+}
+
+// ---------------------------------------
+
+#define SHARED_BS 32
+
+__global__ void sgemm_shared(const float *A,
+                             const float *B, 
+                             float *C, 
+                             int M, int N, int K,
+                             float alpha, float beta) {
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (col >= N || row >= M)
+        return;
+    
+    const int thread_col = threadIdx.x;
+    const int thread_row = threadIdx.y;
+
+    __shared__ float As[SHARED_BS][SHARED_BS + 1];
+    __shared__ float Bs[SHARED_BS][SHARED_BS + 1];
+
+    float tmp = 0.0;
+    for (int kk = 0; kk < K; kk += SHARED_BS) {
+        As[thread_row][thread_col] = A[row * K + (kk + thread_col)];
+        Bs[thread_row][thread_col] = B[(kk + thread_row) * N + col];
+
+        __syncthreads();
+
+        for (int dotIdx = 0; dotIdx < SHARED_BS; ++dotIdx) {
+            tmp += As[thread_row][dotIdx] * Bs[dotIdx][thread_col];
+        }
+
+        __syncthreads();
+    }
+
+    C[row * N + col] = alpha * tmp + beta * C[row * N + col];
 }
 
 // --------------------------------------- Main -------------------------------------------
@@ -364,6 +404,12 @@ int main(int argc, char** argv)
         dim3 grid_size(CEIL_DIV(M, 32), CEIL_DIV(N, 32), 1);
         dim3 block_size(32, 32, 1);
         run_custom_sgemm<sgemm_coalcesed>(handle, dA, dB, dC, M, N, K, iters, block_size, grid_size, "coalcesed global", verify);
+    }
+
+    {
+        dim3 grid_size(CEIL_DIV(M, 32), CEIL_DIV(N, 32), 1);
+        dim3 block_size(32, 32, 1);
+        run_custom_sgemm<sgemm_shared>(handle, dA, dB, dC, M, N, K, iters, block_size, grid_size, "shared", verify);
     }
     
     CHECK_CUBLAS(cublasDestroy(handle));
