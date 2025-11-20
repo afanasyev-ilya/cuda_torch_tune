@@ -302,36 +302,47 @@ __global__ void sgemm_shared(const float *A,
                              float *C, 
                              int M, int N, int K,
                              float alpha, float beta) {
-    const int col = blockIdx.x * blockDim.x + threadIdx.x;
-    const int row = blockIdx.y * blockDim.y + threadIdx.y;
-
-    if (col >= N || row >= M)
-        return;
-    
-    const int thread_col = threadIdx.x;
+    // Thread position within block
     const int thread_row = threadIdx.y;
+    const int thread_col = threadIdx.x;
+    
+    // Global output position
+    const int row = blockIdx.y * blockDim.y + thread_row;
+    const int col = blockIdx.x * blockDim.x + thread_col;
 
-    __shared__ float As[SHARED_TILE_SIZE][SHARED_TILE_SIZE + 1];
-    __shared__ float Bs[SHARED_TILE_SIZE][SHARED_TILE_SIZE + 1];
+    const int block_row = blockIdx.y * blockDim.y;
+    const int block_col = blockIdx.x * blockDim.x;
+    
+    __shared__ float As[SHARED_TILE_SIZE][SHARED_TILE_SIZE];
+    __shared__ float Bs[SHARED_TILE_SIZE][SHARED_TILE_SIZE];
 
     const int num_tiles = (K - 1) / SHARED_TILE_SIZE + 1;
 
-    float sum = 0.0;
-    for (int tile_id = 0; tile_id < num_tiles; tile_id++) {
-        As[thread_row][thread_col] = A[row * K + (tile_id * SHARED_TILE_SIZE + thread_col)];
-        Bs[thread_row][thread_col] = B[(tile_id * SHARED_TILE_SIZE + thread_row) * N + col];
+    float sum = 0.0f;
+
+    A += block_row * K; // row=cRow, col=0
+    B += block_col; // row=0, col=cCol
+    
+    for (int t = 0; t < num_tiles; t++) {
+        As[thread_row][thread_col] = A[thread_row * K + thread_col];
+        Bs[thread_row][thread_col] = B[thread_row * N + thread_col];
 
         __syncthreads();
 
+        A += SHARED_TILE_SIZE;
+        B += SHARED_TILE_SIZE * N;
+
         #pragma unroll
-        for (int dotIdx = 0; dotIdx < SHARED_TILE_SIZE; ++dotIdx) {
-            sum += As[thread_row][dotIdx] * Bs[dotIdx][thread_col];
+        for (int k = 0; k < SHARED_TILE_SIZE; k++) {
+            sum += As[thread_row][k] * Bs[k][thread_col];
         }
 
         __syncthreads();
     }
 
-    C[row * N + col] = alpha * sum + beta * C[row * N + col];
+    if (row < M && col < N) {
+        C[row * N + col] = alpha * sum + beta * C[row * N + col];
+    }
 }
 
 // --------------------------------------- Main -------------------------------------------
