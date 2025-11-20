@@ -283,19 +283,19 @@ __global__ void sgemm_coalcesed(const float *A,
     if (col >= N || row >= M)
         return;
     
-    float tmp = 0.0;
+    float sum = 0.0;
 
     for (int i = 0; i < K; ++i) {
         // we improved memory access patter here, 
-        tmp += A[row * K + i] * B[i * N + col];
+        sum += A[row * K + i] * B[i * N + col];
     }
 
-    C[row * N + col] = alpha * tmp + beta * C[row * N + col];
+    C[row * N + col] = alpha * sum + beta * C[row * N + col];
 }
 
 // ---------------------------------------
 
-#define SHARED_BS 32
+#define SHARED_TILE_SIZE 32
 
 __global__ void sgemm_shared(const float *A,
                              const float *B, 
@@ -311,24 +311,27 @@ __global__ void sgemm_shared(const float *A,
     const int thread_col = threadIdx.x;
     const int thread_row = threadIdx.y;
 
-    __shared__ float As[SHARED_BS][SHARED_BS + 1];
-    __shared__ float Bs[SHARED_BS][SHARED_BS + 1];
+    __shared__ float As[SHARED_TILE_SIZE][SHARED_TILE_SIZE + 1];
+    __shared__ float Bs[SHARED_TILE_SIZE][SHARED_TILE_SIZE + 1];
 
-    float tmp = 0.0;
-    for (int kk = 0; kk < K; kk += SHARED_BS) {
-        As[thread_row][thread_col] = A[row * K + (kk + thread_col)];
-        Bs[thread_row][thread_col] = B[(kk + thread_row) * N + col];
+    const int num_tiles = (K - 1) / SHARED_TILE_SIZE + 1;
+
+    float sum = 0.0;
+    for (int tile_id = 0; tile_id < num_tiles; tile_id++) {
+        As[thread_row][thread_col] = A[row * K + (tile_id * SHARED_TILE_SIZE + thread_col)];
+        Bs[thread_row][thread_col] = B[(tile_id * SHARED_TILE_SIZE + thread_row) * N + col];
 
         __syncthreads();
 
-        for (int dotIdx = 0; dotIdx < SHARED_BS; ++dotIdx) {
-            tmp += As[thread_row][dotIdx] * Bs[dotIdx][thread_col];
+        #pragma unroll
+        for (int dotIdx = 0; dotIdx < SHARED_TILE_SIZE; ++dotIdx) {
+            sum += As[thread_row][dotIdx] * Bs[dotIdx][thread_col];
         }
 
         __syncthreads();
     }
 
-    C[row * N + col] = alpha * tmp + beta * C[row * N + col];
+    C[row * N + col] = alpha * sum + beta * C[row * N + col];
 }
 
 // --------------------------------------- Main -------------------------------------------
@@ -407,8 +410,8 @@ int main(int argc, char** argv)
     }
 
     {
-        dim3 grid_size(CEIL_DIV(M, 32), CEIL_DIV(N, 32), 1);
-        dim3 block_size(32, 32, 1);
+        dim3 grid_size(CEIL_DIV(M, SHARED_TILE_SIZE), CEIL_DIV(N, SHARED_TILE_SIZE), 1);
+        dim3 block_size(SHARED_TILE_SIZE, SHARED_TILE_SIZE, 1);
         run_custom_sgemm<sgemm_shared>(handle, dA, dB, dC, M, N, K, iters, block_size, grid_size, "shared", verify);
     }
     
