@@ -749,6 +749,7 @@ __global__ void wmma_bf16_cta(const __nv_bfloat16* __restrict__ A,
 }
 
 #define WARP_SIZE 32
+#define SCALE 2
 
 __global__ void wmma_bf16_shared(const __nv_bfloat16* __restrict__ A,
                                  const __nv_bfloat16* __restrict__ B,
@@ -763,8 +764,8 @@ __global__ void wmma_bf16_shared(const __nv_bfloat16* __restrict__ A,
     int warp_tile_n = warp_idx / 4;
 
     constexpr int BLOCK_M = 4 * WMMA_M;
-    constexpr int BLOCK_N = 4 * WMMA_N;
-    constexpr int BLOCK_K = WMMA_K;
+    constexpr int BLOCK_N = 2 * WMMA_N;
+    constexpr int BLOCK_K = WMMA_K * SCALE;
 
     // starting row and col of tile
     int block_row = blockIdx.x * BLOCK_M;
@@ -825,24 +826,186 @@ __global__ void wmma_bf16_shared(const __nv_bfloat16* __restrict__ A,
 
         __syncthreads();
 
-        const __nv_bfloat16* tileA = &As[WMMA_M * warp_tile_m][0];
-        const __nv_bfloat16* tileB = &Bs[0][WMMA_N * warp_tile_n];
+        for(int kk = 0; kk < BLOCK_K; kk += WMMA_K) {
+            const __nv_bfloat16* tileA = &As[WMMA_M * warp_tile_m][kk];
+            const __nv_bfloat16* tileB = &Bs[kk][WMMA_N * warp_tile_n];
 
-        int lda_shared = BLOCK_K;
-        int ldb_shared = BLOCK_N;
+            int lda_shared = BLOCK_K;
+            int ldb_shared = BLOCK_N;
 
-        // Load 16x16 tiles from row-major storage
-        wmma::load_matrix_sync(a_frag, tileA, lda_shared);
-        wmma::load_matrix_sync(b_frag, tileB, ldb_shared);
+            // Load 16x16 tiles from row-major storage
+            wmma::load_matrix_sync(a_frag, tileA, lda_shared);
+            wmma::load_matrix_sync(b_frag, tileB, ldb_shared);
 
-        // C_tile += A_tile * B_tile
-        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+            // C_tile += A_tile * B_tile
+            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        }
+        
 
         __syncthreads();
     }
 
     float* tileC = &C[row * N + col];
     wmma::store_matrix_sync(tileC, c_frag, N, wmma::mem_row_major);
+}
+
+// Using nv_bfloat16 directly
+using nv_bfloat16 = __nv_bfloat16;
+
+// Thread block configuration: 4 warps per block
+const int WARPS_PER_BLOCK = 4;
+const int THREADS_PER_BLOCK = WARPS_PER_BLOCK * WARP_SIZE;
+
+// Block tile dimensions (in WMMA tiles)
+const int BLOCK_ROW_WARPS = 2;    // 2 warps compute rows
+const int BLOCK_COL_WARPS = 2;    // 2 warps compute columns
+const int BLOCK_ROW_TILES = BLOCK_ROW_WARPS * 2;  // 4 tiles = 64 rows
+const int BLOCK_COL_TILES = BLOCK_COL_WARPS * 2;  // 4 tiles = 64 columns
+
+// Shared memory configuration with padding to avoid bank conflicts
+const int CHUNK_K = 2;  // Number of K-tiles computed per iteration
+const int SKEW_BF16 = 8;  // Padding to avoid shared memory bank conflicts
+
+#define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
+
+__global__ void bf16_matmul_wmma_opt(const nv_bfloat16* __restrict__ A,
+                                     const nv_bfloat16* __restrict__ B,
+                                     float* __restrict__ C,
+                                     int M, int N, int K) {
+    
+    // Warp and lane identification
+    const unsigned int warpId = threadIdx.x / WARP_SIZE;
+    const unsigned int laneId = threadIdx.x % WARP_SIZE;
+    
+    // This warp's position in the block tile
+    const unsigned int warpRow = warpId / BLOCK_COL_WARPS;
+    const unsigned int warpCol = warpId % BLOCK_COL_WARPS;
+
+    // Static shared memory allocation
+    __shared__ nv_bfloat16 shmem_A[BLOCK_ROW_TILES * WMMA_M][CHUNK_K * WMMA_K + SKEW_BF16];
+    __shared__ nv_bfloat16 shmem_B[BLOCK_COL_TILES * WMMA_N][CHUNK_K * WMMA_K + SKEW_BF16];
+    
+    // Each warp computes 2x2 WMMA tiles (32x32 elements)
+    constexpr int WARP_ROW_TILES = 2;
+    constexpr int WARP_COL_TILES = 2;
+    
+    // Declare the fragments
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, nv_bfloat16, nvcuda::wmma::row_major> a_frag[WARP_ROW_TILES];
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, nv_bfloat16, nvcuda::wmma::col_major> b_frag[WARP_COL_TILES];
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag[WARP_ROW_TILES][WARP_COL_TILES];
+    
+    // Initialize accumulators to zero
+    for (int i = 0; i < WARP_ROW_TILES; i++) {
+        for (int j = 0; j < WARP_COL_TILES; j++) {
+            nvcuda::wmma::fill_fragment(acc_frag[i][j], 0.0f);
+        }
+    }
+    
+    // Loop over K dimension in chunks
+    for (int k_step = 0; k_step < K; k_step += CHUNK_K * WMMA_K) {
+        
+        // Cooperative loading of A and B tiles into shared memory
+        #pragma unroll
+        for (int k_inner = 0; k_inner < CHUNK_K * WMMA_K; k_inner += WARP_SIZE) {
+            int k = k_inner + laneId;
+            if (k < CHUNK_K * WMMA_K) {
+                // Global K index for this step
+                int k_global = k_step + k;
+                
+                // Load A tile - each warp loads a portion of A
+                for (int row = warpRow * WMMA_M; row < (warpRow + 1) * WMMA_M; row++) {
+                    int tile_row = row;
+                    int tile_col = k;
+                    
+                    if (tile_row < BLOCK_ROW_TILES * WMMA_M && k_global < K) {
+                        int global_row = blockIdx.y * BLOCK_ROW_TILES * WMMA_M + tile_row;
+                        int global_col = k_global;
+                        
+                        if (global_row < M) {
+                            shmem_A[tile_row][tile_col] = A[global_row * K + global_col];
+                        } else {
+                            shmem_A[tile_row][tile_col] = nv_bfloat16(0.0f);
+                        }
+                    }
+                }
+                
+                // Load B tile - each warp loads a portion of B  
+                for (int col = warpCol * WMMA_N; col < (warpCol + 1) * WMMA_N; col++) {
+                    int tile_row = col;
+                    int tile_col = k;
+                    
+                    if (tile_row < BLOCK_COL_TILES * WMMA_N && k_global < K) {
+                        int global_row = k_global;
+                        int global_col = blockIdx.x * BLOCK_COL_TILES * WMMA_N + tile_row;
+                        
+                        if (global_col < N) {
+                            shmem_B[tile_row][tile_col] = B[global_row * N + global_col];
+                        } else {
+                            shmem_B[tile_row][tile_col] = nv_bfloat16(0.0f);
+                        }
+                    }
+                }
+            }
+        }
+        
+        __syncthreads();  // Ensure all data is loaded
+        
+        // Perform WMMA operations for this K chunk
+        #pragma unroll
+        for (int tk = 0; tk < CHUNK_K; tk++) {
+            // Load A fragments for this K tile
+            #pragma unroll
+            for (int i = 0; i < WARP_ROW_TILES; i++) {
+                const int tile_row = warpRow * WARP_ROW_TILES + i;
+                const int row_offset = tile_row * WMMA_M;
+                const int k_offset = tk * WMMA_K;
+                
+                nvcuda::wmma::load_matrix_sync(a_frag[i], 
+                    &shmem_A[row_offset][k_offset], 
+                    CHUNK_K * WMMA_K + SKEW_BF16);
+            }
+            
+            // Load B fragments for this K tile
+            #pragma unroll
+            for (int j = 0; j < WARP_COL_TILES; j++) {
+                const int tile_col = warpCol * WARP_COL_TILES + j;
+                const int col_offset = tile_col * WMMA_N;
+                const int k_offset = tk * WMMA_K;
+                
+                nvcuda::wmma::load_matrix_sync(b_frag[j],
+                    &shmem_B[col_offset][k_offset],
+                    CHUNK_K * WMMA_K + SKEW_BF16);
+            }
+            
+            // Perform matrix multiply-accumulate
+            #pragma unroll
+            for (int i = 0; i < WARP_ROW_TILES; i++) {
+                #pragma unroll
+                for (int j = 0; j < WARP_COL_TILES; j++) {
+                    nvcuda::wmma::mma_sync(acc_frag[i][j], a_frag[i], b_frag[j], acc_frag[i][j]);
+                }
+            }
+        }
+        
+        __syncthreads();  // Synchronize before loading next chunk
+    }
+    
+    // Store the results back to global memory
+    for (int i = 0; i < WARP_ROW_TILES; i++) {
+        for (int j = 0; j < WARP_COL_TILES; j++) {
+            const int tile_row = warpRow * WARP_ROW_TILES + i;
+            const int tile_col = warpCol * WARP_COL_TILES + j;
+            
+            const int row_offset = blockIdx.y * BLOCK_ROW_TILES * WMMA_M + tile_row * WMMA_M;
+            const int col_offset = blockIdx.x * BLOCK_COL_TILES * WMMA_N + tile_col * WMMA_N;
+            
+            // Check bounds
+            if (row_offset < M && col_offset < N) {
+                float* base_ptr = &C[row_offset * N + col_offset];
+                nvcuda::wmma::store_matrix_sync(base_ptr, acc_frag[i][j], N, nvcuda::wmma::mem_row_major);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------- Main ----------------------------------------------------
@@ -895,35 +1058,52 @@ int main(int argc, char** argv)
     cublasHandle_t handle;
     CHECK_CUBLAS(cublasCreate(&handle));
 
-    std::cout << "\n -------------- FP32 tests -------------- \n";
-    run_cublas_gemm(handle, M, N, K, dA, dB, dC, iters);
+    bool test_all = false;
 
-    CHECK_CUDA(cudaMemset(dC, 0, bytesC));
-    run_custom_gemm(M, N, K, dA, dB, dC, iters);
+    if(test_all) {
+        std::cout << "\n -------------- FP32 tests -------------- \n";
+        run_cublas_gemm(handle, M, N, K, dA, dB, dC, iters);
 
-    CHECK_CUDA(cudaMemset(dC, 0, bytesC));
-    run_cutlass_gemm(M, N, K, dA, dB, dC, iters);
+        CHECK_CUDA(cudaMemset(dC, 0, bytesC));
+        run_custom_gemm(M, N, K, dA, dB, dC, iters);
 
-    std::cout << "\n -------------- BF16 tests -------------- \n";
+        CHECK_CUDA(cudaMemset(dC, 0, bytesC));
+        run_cutlass_gemm(M, N, K, dA, dB, dC, iters);
 
-    CHECK_CUDA(cudaMemset(dC, 0, bytesC));
-    run_cublas_bf16_tc_gemm(handle, M, N, K, dA, dB, dC, iters);
+        std::cout << "\n -------------- BF16 tests -------------- \n";
 
-    CHECK_CUDA(cudaMemset(dC, 0, bytesC));
-    dim3 naive_block(32, 1, 1);
-    dim3 naive_grid((M - 1)/WMMA_M + 1, (N - 1)/WMMA_N + 1);
-    run_wmma_bf16_gemm<wmma_bf16_naive_gemm_kernel>(M, N, K, dA, dB, dC, iters, naive_block, naive_grid, handle, "WMMA naive");
+        CHECK_CUDA(cudaMemset(dC, 0, bytesC));
+        run_cublas_bf16_tc_gemm(handle, M, N, K, dA, dB, dC, iters);
 
-    CHECK_CUDA(cudaMemset(dC, 0, bytesC));
-    dim3 cta_block(32, 4, 4);
-    dim3 cta_grid(1, (M - 1)/(WMMA_M*4) + 1, (N - 1)/(WMMA_N*4) + 1);
-    run_wmma_bf16_gemm<wmma_bf16_cta>(M, N, K, dA, dB, dC, iters, cta_block, cta_grid, handle, "WMMA CTA");
+        CHECK_CUDA(cudaMemset(dC, 0, bytesC));
+        dim3 naive_block(32, 1, 1);
+        dim3 naive_grid((M - 1)/WMMA_M + 1, (N - 1)/WMMA_N + 1);
+        run_wmma_bf16_gemm<wmma_bf16_naive_gemm_kernel>(M, N, K, dA, dB, dC, iters, naive_block, naive_grid, handle, "WMMA naive");
 
-    CHECK_CUDA(cudaMemset(dC, 0, bytesC));
-    dim3 shared_block(512, 1, 1);
-    dim3 shared_grid((M - 1)/(WMMA_M*4) + 1, (N - 1)/(WMMA_N*4) + 1);
-    run_wmma_bf16_gemm<wmma_bf16_shared>(M, N, K, dA, dB, dC, iters, shared_block, shared_grid, handle, "WMMA shared");
+        CHECK_CUDA(cudaMemset(dC, 0, bytesC));
+        dim3 cta_block(32, 4, 4);
+        dim3 cta_grid(1, (M - 1)/(WMMA_M*4) + 1, (N - 1)/(WMMA_N*4) + 1);
+        run_wmma_bf16_gemm<wmma_bf16_cta>(M, N, K, dA, dB, dC, iters, cta_block, cta_grid, handle, "WMMA CTA");
 
+        CHECK_CUDA(cudaMemset(dC, 0, bytesC));
+        dim3 shared_block(256, 1, 1);
+        dim3 shared_grid((M - 1)/(WMMA_M*4) + 1, (N - 1)/(WMMA_N*2) + 1);
+        run_wmma_bf16_gemm<wmma_bf16_shared>(M, N, K, dA, dB, dC, iters, shared_block, shared_grid, handle, "WMMA shared");
+
+        CHECK_CUDA(cudaMemset(dC, 0, bytesC));
+        dim3 opt_grid(CEIL_DIV(N, BLOCK_COL_TILES * WMMA_N),
+                CEIL_DIV(M, BLOCK_ROW_TILES * WMMA_M),
+                1);
+        dim3 opt_block(THREADS_PER_BLOCK, 1, 1);
+        run_wmma_bf16_gemm<bf16_matmul_wmma_opt>(M, N, K, dA, dB, dC, iters, opt_block, opt_grid, handle, "WMMA opt");
+    } else {
+        CHECK_CUDA(cudaMemset(dC, 0, bytesC));
+        dim3 cta_block(32, 4, 4);
+        dim3 cta_grid(1, (M - 1)/(WMMA_M*4) + 1, (N - 1)/(WMMA_N*4) + 1);
+        run_wmma_bf16_gemm<wmma_bf16_cta>(M, N, K, dA, dB, dC, iters, cta_block, cta_grid, handle, "WMMA CTA");
+    }
+
+    
     CHECK_CUBLAS(cublasDestroy(handle));
 
     cudaFree(dA);
