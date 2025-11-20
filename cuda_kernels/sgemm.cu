@@ -310,27 +310,18 @@ __global__ void sgemm_shared(const float *A,
     const int row = blockIdx.y * blockDim.y + thread_row;
     const int col = blockIdx.x * blockDim.x + thread_col;
 
-    const int block_row = blockIdx.y * blockDim.y;
-    const int block_col = blockIdx.x * blockDim.x;
-    
     __shared__ float As[SHARED_TILE_SIZE][SHARED_TILE_SIZE];
     __shared__ float Bs[SHARED_TILE_SIZE][SHARED_TILE_SIZE];
 
     const int num_tiles = (K - 1) / SHARED_TILE_SIZE + 1;
 
     float sum = 0.0f;
-
-    A += block_row * K; // row=cRow, col=0
-    B += block_col; // row=0, col=cCol
     
     for (int t = 0; t < num_tiles; t++) {
-        As[thread_row][thread_col] = A[thread_row * K + thread_col];
-        Bs[thread_row][thread_col] = B[thread_row * N + thread_col];
+        As[thread_row][thread_col] = A[row * K + (thread_col + t*SHARED_TILE_SIZE)];
+        Bs[thread_row][thread_col] = B[(thread_row + t*SHARED_TILE_SIZE) * N + col];
 
         __syncthreads();
-
-        A += SHARED_TILE_SIZE;
-        B += SHARED_TILE_SIZE * N;
 
         #pragma unroll
         for (int k = 0; k < SHARED_TILE_SIZE; k++) {
