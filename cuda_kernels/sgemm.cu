@@ -348,7 +348,7 @@ int main(int argc, char** argv)
 
     int iters = 10;
     if (argc > 2)
-        iters = std::atoi(argv[1]);
+        iters = std::atoi(argv[2]);
 
     std::cout << "SGEMM benchmark: C = A * B (row-major FP32)\n";
     std::cout << "  M = " << M << ", N = " << N << ", K = " << K
