@@ -9,6 +9,7 @@
 #include <random>
 #include <cstdlib>
 #include <cmath>
+#include <cassert>
 
 // ----------------- Helpers & macros -----------------
 
@@ -338,12 +339,9 @@ __global__ void sgemm_shared(const float *A,
 
 // ---------------------------------------
 
-#define BLOCK_1D_BM 64
-#define BLOCK_1D_BN 64
-#define BLOCK_1D_BK 8
-
 // idea is https://siboehm.com/assets/img/CUDA-MMM/kernel_4_1D_blocktiling.png
 // each thread calculates small TM size column of matrix C elements
+template<int BM, int BN, int BK, int ELEM_PER_THREAD>
 __global__ void sgemm_1D_blocking(const float *A,
                                   const float *B, 
                                   float *C, 
@@ -354,21 +352,21 @@ __global__ void sgemm_1D_blocking(const float *A,
     const int thread_col = threadIdx.x; // should be 0, 64
     
     // Starting coords of 64x64 output tile for matrix C
-    const int block_row = blockIdx.y * BLOCK_1D_BM;
-    const int block_col = blockIdx.x * BLOCK_1D_BN;
+    const int block_row = blockIdx.y * BM;
+    const int block_col = blockIdx.x * BN;
 
     // we multiply 64x8 * 8x64 to get 64x64 block. 
-    __shared__ float As[BLOCK_1D_BM][BLOCK_1D_BK];
-    __shared__ float Bs[BLOCK_1D_BK][BLOCK_1D_BN];
+    __shared__ float As[BM][BK];
+    __shared__ float Bs[BK][BN];
 
     // This results into more K steps then previosly (we used 32), but does not matter much
-    const int num_tiles = (K - 1) / BLOCK_1D_BK + 1;
+    const int num_tiles = (K - 1) / BK + 1;
 
-    const int TM = 8; // 64 / 8 = BM / block_size.y
-    float sums[TM] = {0.0f};
+    // ELEM_PER_THREAD = 64 / 8 = BM / block_size.y
+    float sums[ELEM_PER_THREAD] = {0.0f};
     
     for (int t = 0; t < num_tiles; t++) {
-        int tile_offset = t * BLOCK_1D_BK;
+        int tile_offset = t * BK;
         // since we have 64*8 = 512 threads and shared memory size is 512, we can copy in one pass without loop
         As[thread_col][thread_row] = A[(block_row + thread_col) * K + (thread_row + tile_offset)];
         // B access is coalcesed
@@ -376,11 +374,11 @@ __global__ void sgemm_1D_blocking(const float *A,
 
         __syncthreads();
 
-        for (int dot_idx = 0; dot_idx < BLOCK_1D_BK; ++dot_idx) {
+        for (int dot_idx = 0; dot_idx < BK; ++dot_idx) {
             float B_val = Bs[dot_idx][thread_col];
             #pragma unroll
-            for (int elt_idx = 0; elt_idx < TM; ++elt_idx) {
-                sums[elt_idx] += As[TM * thread_row + elt_idx][dot_idx] * B_val;
+            for (int elt_idx = 0; elt_idx < ELEM_PER_THREAD; ++elt_idx) {
+                sums[elt_idx] += As[ELEM_PER_THREAD * thread_row + elt_idx][dot_idx] * B_val;
             }
         }
 
@@ -388,16 +386,19 @@ __global__ void sgemm_1D_blocking(const float *A,
     }
 
     #pragma unroll
-    for(int elt_idx = 0; elt_idx < TM; elt_idx++) {
+    for(int elt_idx = 0; elt_idx < ELEM_PER_THREAD; elt_idx++) {
         // each threads writes back TM elements of matrix C of the same col (adj rows)
-        int row = block_row + thread_row * TM + elt_idx;
+        int row = block_row + thread_row * ELEM_PER_THREAD + elt_idx;
         int col = block_col + thread_col;
         if (row < M && col < N) {
             C[row * N + col] = alpha * sums[elt_idx] + beta * C[row * N + col];
         }
     }
-    
 }
+
+// ---------------------------------------
+
+
 
 // --------------------------------------- Main -------------------------------------------
 
@@ -481,9 +482,55 @@ int main(int argc, char** argv)
     }
 
     {
-        dim3 grid_size(CEIL_DIV(N, 64), CEIL_DIV(M, 8*8), 1);
-        dim3 block_size(64, 8, 1);
-        run_custom_sgemm<sgemm_1D_blocking>(handle, dA, dB, dC, M, N, K, iters, block_size, grid_size, "1D blocking", verify);
+        std::cout << "using 4 element per thread:\n";
+        const int BM = 64;
+        const int BN = 64;
+        assert(BM == BN);
+        const int ELEM_PER_THREAD = 4;
+        const int BK = BM / ELEM_PER_THREAD;
+        
+        dim3 block_size(BM, BK, 1);
+        dim3 grid_size(CEIL_DIV(N, block_size.x), CEIL_DIV(M, block_size.y*ELEM_PER_THREAD), 1);
+        run_custom_sgemm<sgemm_1D_blocking<BM, BN, BK, ELEM_PER_THREAD>>(handle, dA, dB, dC, M, N, K, iters, block_size, grid_size, "1D blocking", verify);
+    }
+
+    {
+        std::cout << "using 8 element per thread:\n";
+        const int BM = 64;
+        const int BN = 64;
+        assert(BM == BN);
+        const int ELEM_PER_THREAD = 8;
+        const int BK = BM / ELEM_PER_THREAD;
+        
+        dim3 block_size(BM, BK, 1);
+        dim3 grid_size(CEIL_DIV(N, block_size.x), CEIL_DIV(M, block_size.y*ELEM_PER_THREAD), 1);
+        run_custom_sgemm<sgemm_1D_blocking<BM, BN, BK, ELEM_PER_THREAD>>(handle, dA, dB, dC, M, N, K, iters, block_size, grid_size, "1D blocking", verify);
+    }
+
+    {
+        std::cout << "using 16 element per thread:\n";
+        const int BM = 64;
+        const int BN = 64;
+        assert(BM == BN);
+        const int ELEM_PER_THREAD = 16;
+        const int BK = BM / ELEM_PER_THREAD;
+        
+        dim3 block_size(BM, BK, 1);
+        dim3 grid_size(CEIL_DIV(N, block_size.x), CEIL_DIV(M, block_size.y*ELEM_PER_THREAD), 1);
+        run_custom_sgemm<sgemm_1D_blocking<BM, BN, BK, ELEM_PER_THREAD>>(handle, dA, dB, dC, M, N, K, iters, block_size, grid_size, "1D blocking", verify);
+    }
+
+    {
+        std::cout << "using 32 element per thread:\n";
+        const int BM = 64;
+        const int BN = 64;
+        assert(BM == BN);
+        const int ELEM_PER_THREAD = 32;
+        const int BK = BM / ELEM_PER_THREAD;
+        
+        dim3 block_size(BM, BK, 1);
+        dim3 grid_size(CEIL_DIV(N, block_size.x), CEIL_DIV(M, block_size.y*ELEM_PER_THREAD), 1);
+        run_custom_sgemm<sgemm_1D_blocking<BM, BN, BK, ELEM_PER_THREAD>>(handle, dA, dB, dC, M, N, K, iters, block_size, grid_size, "1D blocking", verify);
     }
     
     CHECK_CUBLAS(cublasDestroy(handle));
