@@ -377,14 +377,17 @@ __global__ void sgemm_1D_blocking(const float *A,
         __syncthreads();
 
         for (int dot_idx = 0; dot_idx < BLOCK_1D_BK; ++dot_idx) {
+            float B_val = Bs[dot_idx][thread_col];
+            #pragma unroll
             for (int elt_idx = 0; elt_idx < TM; ++elt_idx) {
-                sums[elt_idx] += As[TM * thread_row + elt_idx][dot_idx] * Bs[dot_idx][thread_col];
+                sums[elt_idx] += As[TM * thread_row + elt_idx][dot_idx] * B_val;
             }
         }
 
         __syncthreads();
     }
 
+    #pragma unroll
     for(int elt_idx = 0; elt_idx < TM; elt_idx++) {
         // each threads writes back TM elements of matrix C of the same col (adj rows)
         int row = block_row + thread_row * TM + elt_idx;
