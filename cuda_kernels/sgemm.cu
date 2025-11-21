@@ -397,7 +397,7 @@ __global__ void sgemm_1D_blocking(const float *A,
 
 // ---------------------------------------
 
-// MICRO_M * MICRO_K = elt per thread
+// MICRO_M * MICRO_K = elements processed by each thread
 template<int TILE_M, int TILE_N, int TILE_K, int MICRO_M, int MICRO_N>
 __global__ void sgemm_2D_blocking(const float *A,
                                   const float *B, 
@@ -405,14 +405,14 @@ __global__ void sgemm_2D_blocking(const float *A,
                                   int M, int N, int K,
                                   float alpha, float beta) {
     // Thread position within block
-    const int thread_row = threadIdx.y; // should be 0, 8
-    const int thread_col = threadIdx.x; // should be 0, 8
+    const int thread_row = threadIdx.y;
+    const int thread_col = threadIdx.x;
     
-    // Starting coords of 64x64 output tile for matrix C
+    // Starting coords of output tile for matrix C
     const int block_row = blockIdx.y * TILE_M;
     const int block_col = blockIdx.x * TILE_N;
 
-    // ldas for simplicity
+    // leading dims for simplicity
     const int lda = K;
     const int ldb = N;
     const int ldc = N;
@@ -427,10 +427,13 @@ __global__ void sgemm_2D_blocking(const float *A,
     const int num_tiles = (K - 1) / TILE_K + 1;
 
     float reg_sums[MICRO_M][MICRO_N] = {0};
+    float reg_a[MICRO_M] = {0};
+    float reg_b[MICRO_N] = {0};
     
     for (int tile_id = 0; tile_id < num_tiles; tile_id++) {
         int tile_offset = tile_id * TILE_K;
         // copy A
+        #pragma unroll
         for(int i = tid; i < TILE_M*TILE_K; i += block_size) {
             int shared_col = i % TILE_K; // changes in range of [0, TILE_K]
             int shared_row = i / TILE_K; // changes in range of [0, TILE_M]
@@ -440,14 +443,58 @@ __global__ void sgemm_2D_blocking(const float *A,
             As[shared_row][shared_col] = A[global_row * lda + global_col];
         }
 
+        // copy B
+        #pragma unroll
+        for(int i = tid; i < TILE_K*TILE_N; i += block_size) {
+            int shared_col = i % TILE_N; // changes in range of [0, TILE_N]
+            int shared_row = i / TILE_N; // changes in range of [0, TILE_K]
+
+            int global_col = block_row + shared_col;
+            int global_row = tile_offset + shared_row;
+            Bs[shared_row][shared_col] = B[global_row * ldb + global_col];
+        }
+
         __syncthreads();
 
-        // mult
+        for(int dot_idx = 0; dot_idx < TILE_K; dot_idx++) {
+            #pragma unroll
+            for(int elt_idx = 0; elt_idx < MICRO_M; elt_idx++) {
+                // this is actually most complext thing here
+                // similar to 1d, dot_idx runs among cols A
+                // and for rows, we just copy MICRO_M elements (row elements per thread)
+                reg_a[elt_idx] = As[thread_row * MICRO_M + elt_idx][dot_idx];
+            }
+            
+            #pragma unroll
+            for(int elt_idx = 0; elt_idx < MICRO_N; elt_idx++) {
+                // vise versa but for B matrix
+                reg_b[elt_idx] = Bs[dot_idx][thread_col * MICRO_N + elt_idx];
+            }
+
+            // actual matmul on registers here
+            #pragma unroll
+            for(int a_idx = 0; a_idx < MICRO_M; a_idx++) {
+                #pragma unroll
+                for(int b_idx = 0; b_idx < MICRO_N; b_idx++) {
+                    reg_sums[a_idx][b_idx] += reg_a[a_idx] * reg_b[b_idx];
+                }
+            }
+        }
 
         __syncthreads();
     }
 
-    
+    #pragma unroll
+    for(int a_idx = 0; a_idx < MICRO_M; a_idx++) {
+        #pragma unroll
+        for(int b_idx = 0; b_idx < MICRO_N; b_idx++) {
+            int row = block_row + thread_row * MICRO_M + a_idx;
+            int col = block_col + thread_col * MICRO_N + b_idx;
+            if (row < M && col < N) {
+                C[row * ldc + col] = alpha * reg_sums[a_idx][b_idx] + beta * C[row * ldc + col];
+            }
+        }
+    }
 }
 
 // --------------------------------------- Main -------------------------------------------
