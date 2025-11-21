@@ -734,21 +734,39 @@ int main(int argc, char** argv)
     run_1d_blocking.operator()<32>();
 
     {
+        const int BM = 64;
+        const int BN = 64;
+        const int BK = 8;
         const int MICRO_M = 4;
         const int MICRO_N = 4;
-        dim3 block_size(16, 16, 1);
+        dim3 block_size(BN/MICRO_N, BM/MICRO_M, 1);
         dim3 grid_size(CEIL_DIV(N, block_size.x * MICRO_N), CEIL_DIV(M, block_size.y * MICRO_M), 1);
-        run_custom_sgemm<sgemm_2D_blocking<64, 64, 8, MICRO_M, MICRO_N>>(
+        run_custom_sgemm<sgemm_2D_blocking<BM, BN, BK, MICRO_M, MICRO_N>>(
             handle, dA, dB, dC, M, N, K, iters, block_size, grid_size, "2D blocking", verify);
     }
 
     {
+        const int BM = 64;
+        const int BN = 64;
+        const int BK = 8;
         const int MICRO_M = 4;
         const int MICRO_N = 4;
-        dim3 block_size(16, 16, 1);
+        dim3 block_size(BN/MICRO_N, BM/MICRO_M, 1);
         dim3 grid_size(CEIL_DIV(N, block_size.x * MICRO_N), CEIL_DIV(M, block_size.y * MICRO_M), 1);
-        run_custom_sgemm<sgemm_vectorize_smem<64, 64, 8, MICRO_M, MICRO_N>>(
+        run_custom_sgemm<sgemm_vectorize_smem<BM, BN, BK, MICRO_M, MICRO_N>>(
             handle, dA, dB, dC, M, N, K, iters, block_size, grid_size, "vectorize shmem", verify);
+    }
+
+    {
+        const int BM = 128;
+        const int BN = 128;
+        const int BK = 16;
+        const int MICRO_M = 8;
+        const int MICRO_N = 8;
+        dim3 block_size(BN/MICRO_N, BM/MICRO_M, 1);
+        dim3 grid_size(CEIL_DIV(N, block_size.x * MICRO_N), CEIL_DIV(M, block_size.y * MICRO_M), 1);
+        run_custom_sgemm<sgemm_vectorize_smem<BM, BN, BK, MICRO_M, MICRO_N>>(
+            handle, dA, dB, dC, M, N, K, iters, block_size, grid_size, "autotune", verify);
     }
     
     CHECK_CUBLAS(cublasDestroy(handle));
