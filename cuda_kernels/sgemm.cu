@@ -164,7 +164,8 @@ double run_custom_sgemm(cublasHandle_t handle,
                         dim3 block_size,
                         dim3 grid_size,
                         std::string name,
-                        bool verify = true)
+                        bool verify = true,
+                        bool verbose = true)
     {
     float alpha = 1.0;
     float betta = 1.0;
@@ -198,28 +199,31 @@ double run_custom_sgemm(cublasHandle_t handle,
 
         double max_abs = 0.0;
         double max_rel = 0.0;
-        const int max_print_count = 0;
         for (int64_t i = 0; i < sizeC; ++i) {
             double ref = hC_ref[i];
             double val = hC[i];
             double diff = std::abs(val - ref);
             double rel  = (std::abs(ref) > 0.0) ? diff / std::abs(ref) : diff;
 
-            if(i < max_print_count) {
-                std::cout << ref << " vs " << val << std::endl;
-            }
-
             max_abs = std::max(diff, max_abs);
             max_rel = std::max(rel, max_rel);
         }
 
-        std::cout << "check: max_abs = " << max_abs << ", max_rel = " << max_rel << "   ";
+        if(verbose)
+            std::cout << "check: max_abs = " << max_abs << ", max_rel = " << max_rel << "   ";
 
         double tol = 1e-3;  // BF16-level accuracy, adjust if you like
+        bool correct = true;
         if (max_abs < tol) {
-            std::cout << "  (OK)" << std::endl;
+            if(verbose)
+                std::cout << "  (OK)" << std::endl;
         } else {
-            std::cout << "  (WARN)" << std::endl;
+            if(verbose)
+                std::cout << "  (ERROR)" << std::endl;
+            correct = false;
+        }
+        if(!correct) {
+            return 0.0;
         }
     }
 
@@ -246,7 +250,8 @@ double run_custom_sgemm(cublasHandle_t handle,
     double flops = 2.0 * double(M) * double(N) * double(K);
     double tflops = flops / (avg_ms * 1e-3) / 1e12;
 
-    std::cout << "[" << name << "]\navg time: " << avg_ms << " ms,\n   " << tflops << " TFLOP/s" << std::endl << std::endl;
+    if(verbose)
+        std::cout << "[" << name << "]\navg time: " << avg_ms << " ms,\n   " << tflops << " TFLOP/s" << std::endl << std::endl;
     return tflops;
 }
 
@@ -641,6 +646,18 @@ struct Config {
     double flops;
 };
 
+std::ostream& operator<<(std::ostream& os, const Config& c) {
+    os << "Config{"
+       << "BM=" << c.BM
+       << ", BN=" << c.BN
+       << ", BK=" << c.BK
+       << ", MICRO_M=" << c.MICRO_M
+       << ", MICRO_N=" << c.MICRO_N
+       << ", flops=" << c.flops
+       << "}";
+    return os;
+}
+
 template<int BM, int BN, int BK, int MICRO_M, int MICRO_N>
 double bench_config(cublasHandle_t handle,
                     const float* dA, const float* dB, float* dC,
@@ -663,10 +680,11 @@ double bench_config(cublasHandle_t handle,
     // size_t smem = (BM * BK + BK * BN) * sizeof(float);
     // if (smem > max_smem_per_block) return 0.0;
 
+    bool verbose = false;
     double flops = run_custom_sgemm<sgemm_vectorize_smem<BM, BN, BK, MICRO_M, MICRO_N>>(
         handle, dA, dB, dC, M, N, K, iters,
         block_size, grid_size,
-        "autotune", verify
+        "autotune", verify, verbose
     );
     return flops;
 }
@@ -690,9 +708,25 @@ Config autotune_sgemm(cublasHandle_t handle,
         update(BM, BN, BK, MM, NN, g);                             \
     } while (0)
 
-    // ---- candidate set (example, see section 2 below) ----
+    // square-ish tiles, low BK
     TRY( 64,  64,  8,  4,  4);
-    // ... add more as needed
+    TRY( 64,  64,  8,  8,  4);
+    TRY( 64,  64,  8,  4,  8);
+
+    TRY(128, 128,  8,  4,  4);
+    TRY(128, 128,  8,  8,  4);
+    TRY(128, 128,  8,  4,  8);
+
+    // higher BK
+    TRY( 64,  64, 16,  4,  4);
+    TRY(128, 128, 16,  4,  4);
+    TRY(128, 128, 16,  8,  8);
+
+    // rectangular tiles
+    TRY(128,  64,  8,  8,  4);
+    TRY( 64, 128,  8,  4,  8);
+    TRY(128,  64, 16,  8,  4);
+    TRY( 64, 128, 16,  4,  8);
 
     #undef TRY
 
@@ -825,8 +859,20 @@ int main(int argc, char** argv)
     }
 
     {   
-        auto best_config = autotune_sgemm(handle, dA, dB, dC, M, N, K, iters, verify);
-        std::cout << best_config.flops << std::endl;
+        auto cfg = autotune_sgemm(handle, dA, dB, dC, M, N, K, iters, verify);
+        std::cout << cfg << std::endl;
+
+        // results for RTX 3060
+        const int BM = 64;
+        const int BN = 64;
+        const int BK = 8;
+        const int MICRO_M = 8;
+        const int MICRO_N = 4;
+
+        dim3 block_size(BN/MICRO_N, BM/MICRO_M, 1);
+        dim3 grid_size(CEIL_DIV(N, block_size.x * MICRO_N), CEIL_DIV(M, block_size.y * MICRO_M), 1);
+        run_custom_sgemm<sgemm_vectorize_smem<BM, BN, BK, MICRO_M, MICRO_N>>(
+            handle, dA, dB, dC, M, N, K, iters, block_size, grid_size, "autotune", verify);
     }
     
     CHECK_CUBLAS(cublasDestroy(handle));
