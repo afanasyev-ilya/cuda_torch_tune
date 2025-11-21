@@ -11,6 +11,8 @@
 #include <cmath>
 #include <cassert>
 
+double BASELINE_TFLOPS = 1;
+
 // ----------------- Helpers & macros -----------------
 
 #define CHECK_CUDA(call)                                               \
@@ -121,6 +123,7 @@ void run_cublas_gemm(cublasHandle_t handle, int M, int N, int K, const float* dA
     double avg_ms = total_ms / iters;
     double flops = 2.0 * double(M) * double(N) * double(K);
     double tflops = flops / (avg_ms * 1e-3) / 1e12;
+    BASELINE_TFLOPS = tflops;
 
     std::cout << "[cuBLAS SGEMM]\navg time: " << avg_ms << " ms, \n   TFLOP/s: " << tflops << std::endl << std::endl;
 }
@@ -250,8 +253,11 @@ double run_custom_sgemm(cublasHandle_t handle,
     double flops = 2.0 * double(M) * double(N) * double(K);
     double tflops = flops / (avg_ms * 1e-3) / 1e12;
 
-    if(verbose)
-        std::cout << "[" << name << "]\navg time: " << avg_ms << " ms,\n   " << tflops << " TFLOP/s" << std::endl << std::endl;
+    if(verbose) {
+        std::cout << "[" << name << "]\n";
+        std::cout << "avg time: " << avg_ms << " ms\n";
+        std::cout << tflops << " TFLOP/s (" << 100.0*(tflops/BASELINE_TFLOPS) << "%)" << std::endl << std::endl;
+    }
     return tflops;
 }
 
@@ -859,8 +865,10 @@ int main(int argc, char** argv)
     }
 
     {   
+        std::cout << "Autotuning in process..." << std::endl;
         auto cfg = autotune_sgemm(handle, dA, dB, dC, M, N, K, iters, verify);
-        std::cout << cfg << std::endl;
+        std::cout << "done!" << std::endl;
+        std::cout << "best result: " << cfg << std::endl << std::endl;
 
         // results for RTX 3060
         const int BM = 64;
