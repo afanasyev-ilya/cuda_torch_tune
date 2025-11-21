@@ -336,6 +336,66 @@ __global__ void sgemm_shared(const float *A,
     }
 }
 
+// ---------------------------------------
+
+#define BLOCK_1D_BM 64
+#define BLOCK_1D_BN 64
+#define BLOCK_1D_BK 8
+
+// idea is https://siboehm.com/assets/img/CUDA-MMM/kernel_4_1D_blocktiling.png
+// each thread calculates small TM size column of matrix C elements
+__global__ void sgemm_1D_blocking(const float *A,
+                                  const float *B, 
+                                  float *C, 
+                                  int M, int N, int K,
+                                  float alpha, float beta) {
+    // Thread position within block
+    const int thread_row = threadIdx.y; // should be 0, 8
+    const int thread_col = threadIdx.x; // should be 0, 64
+    
+    // Starting coords of 64x64 output tile for matrix C
+    const int block_row = blockIdx.y * BLOCK_1D_BM;
+    const int block_col = blockIdx.x * BLOCK_1D_BN;
+
+    // we multiply 64x8 * 8x64 to get 64x64 block. 
+    __shared__ float As[BLOCK_1D_BM][BLOCK_1D_BK];
+    __shared__ float Bs[BLOCK_1D_BK][BLOCK_1D_BN];
+
+    // This results into more K steps then previosly (we used 32), but does not matter much
+    const int num_tiles = (K - 1) / BLOCK_1D_BK + 1;
+
+    const int TM = 8; // 64 / 8 = BM / block_size.y
+    float sums[TM] = {0.0f};
+    
+    for (int t = 0; t < num_tiles; t++) {
+        int tile_offset = t * BLOCK_1D_BK;
+        // since we have 64*8 = 512 threads and shared memory size is 512, we can copy in one pass without loop
+        As[thread_col][thread_row] = A[(block_row + thread_col) * K + (thread_row + tile_offset)];
+        // B access is coalcesed
+        Bs[thread_row][thread_col] = B[(thread_row + tile_offset) * N + (block_col + thread_col)];
+
+        __syncthreads();
+
+        for (int dot_idx = 0; dot_idx < BLOCK_1D_BK; ++dot_idx) {
+            for (int elt_idx = 0; elt_idx < TM; ++elt_idx) {
+                sums[elt_idx] += As[TM * thread_row + elt_idx][dot_idx] * Bs[dot_idx][thread_col];
+            }
+        }
+
+        __syncthreads();
+    }
+
+    for(int elt_idx = 0; elt_idx < TM; elt_idx++) {
+        // each threads writes back TM elements of matrix C of the same col (adj rows)
+        int row = block_row + thread_row * TM + elt_idx;
+        int col = block_col + thread_col;
+        if (row < M && col < N) {
+            C[row * N + col] = alpha * sums[elt_idx] + beta * C[row * N + col];
+        }
+    }
+    
+}
+
 // --------------------------------------- Main -------------------------------------------
 
 int main(int argc, char** argv)
@@ -400,21 +460,27 @@ int main(int argc, char** argv)
 
     if(run_slow)
     {
-        dim3 grid_size(CEIL_DIV(M, 32), CEIL_DIV(N, 32), 1);
+        dim3 grid_size(CEIL_DIV(N, 32), CEIL_DIV(M, 32), 1);
         dim3 block_size(32, 32, 1);
         run_custom_sgemm<sgemm_naive>(handle, dA, dB, dC, M, N, K, iters, block_size, grid_size, "naive global", verify);
     }
 
     {
-        dim3 grid_size(CEIL_DIV(M, 32), CEIL_DIV(N, 32), 1);
+        dim3 grid_size(CEIL_DIV(N, 32), CEIL_DIV(M, 32), 1);
         dim3 block_size(32, 32, 1);
         run_custom_sgemm<sgemm_coalcesed>(handle, dA, dB, dC, M, N, K, iters, block_size, grid_size, "coalcesed global", verify);
     }
 
     {
-        dim3 grid_size(CEIL_DIV(M, SHARED_TILE_SIZE), CEIL_DIV(N, SHARED_TILE_SIZE), 1);
+        dim3 grid_size(CEIL_DIV(N, SHARED_TILE_SIZE), CEIL_DIV(M, SHARED_TILE_SIZE), 1);
         dim3 block_size(SHARED_TILE_SIZE, SHARED_TILE_SIZE, 1);
         run_custom_sgemm<sgemm_shared>(handle, dA, dB, dC, M, N, K, iters, block_size, grid_size, "shared", verify);
+    }
+
+    {
+        dim3 grid_size(CEIL_DIV(N, 64), CEIL_DIV(M, 8*8), 1);
+        dim3 block_size(64, 8, 1);
+        run_custom_sgemm<sgemm_1D_blocking>(handle, dA, dB, dC, M, N, K, iters, block_size, grid_size, "1D blocking", verify);
     }
     
     CHECK_CUBLAS(cublasDestroy(handle));
