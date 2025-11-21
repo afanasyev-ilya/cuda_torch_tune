@@ -514,6 +514,125 @@ __global__ void sgemm_2D_blocking(const float *A,
     }
 }
 
+
+// ---------------------------------------
+
+template<int TILE_M, int TILE_N, int TILE_K, int MICRO_M, int MICRO_N>
+__global__ void sgemm_vectorize_smem(const float *A,
+                                     const float *B, 
+                                     float *C, 
+                                     int M, int N, int K,
+                                     float alpha, float beta) {
+    // Thread position within block
+    const int thread_row = threadIdx.y;
+    const int thread_col = threadIdx.x;
+    
+    // Starting coords of output tile for matrix C
+    const int block_row = blockIdx.y * TILE_M;
+    const int block_col = blockIdx.x * TILE_N;
+
+    // leading dims for simplicity
+    const int lda = K;
+    const int ldb = N;
+    const int ldc = N;
+
+    // indexes for loading
+    const int tid = threadIdx.x + blockDim.x * threadIdx.y;
+    const int block_size = blockDim.x * blockDim.y;
+
+    // change: we transposed As here
+    __shared__ float As[TILE_K * TILE_M];
+    __shared__ float Bs[TILE_K * TILE_N];
+
+    const int num_tiles = (K - 1) / TILE_K + 1;
+
+    float reg_sums[MICRO_M][MICRO_N] = {0};
+    float reg_a[MICRO_M] = {0};
+    float reg_b[MICRO_N] = {0};
+    
+    for (int tile_id = 0; tile_id < num_tiles; tile_id++) {
+        int tile_offset = tile_id * TILE_K;
+        // copy A
+        constexpr int VECTOR_LENGTH = 4;
+        
+        // we do less loop step now, because of copy is done using vectors
+        #pragma unroll
+        for(int i = tid; i < (TILE_M*TILE_K) / VECTOR_LENGTH; i += block_size) {
+            int linear_idx = i * VECTOR_LENGTH;
+            // shared cols go with stride 4 (VECTOR_LENGTH) now
+            int shared_col = linear_idx % TILE_K; // changes in range of [0, TILE_K], with strides
+            int shared_row = linear_idx / TILE_K; // changes in range of [0, TILE_M]
+
+            int global_col = tile_offset + shared_col;
+            int global_row = block_row + shared_row;
+            
+            float4 tmp = reinterpret_cast<const float4 *>(&A[global_row * lda + global_col])[0];
+            As[(shared_col + 0) * TILE_M + shared_row] = tmp.x;
+            As[(shared_col + 1) * TILE_M + shared_row] = tmp.y;
+            As[(shared_col + 2) * TILE_M + shared_row] = tmp.z;
+            As[(shared_col + 3) * TILE_M + shared_row] = tmp.w;
+        }
+
+        // copy B
+        #pragma unroll
+        for(int i = tid; i < (TILE_K*TILE_N) / VECTOR_LENGTH; i += block_size) {
+            int linear_idx = i * VECTOR_LENGTH;
+            int shared_col = linear_idx % TILE_N; // changes in range of [0, TILE_N], with strides
+            int shared_row = linear_idx / TILE_N; // changes in range of [0, TILE_K]
+
+            int global_col = block_col + shared_col;
+            int global_row = tile_offset + shared_row;
+
+            float4 tmp = reinterpret_cast<const float4 *>(&B[global_row * ldb + global_col])[0];
+            Bs[(shared_row) * TILE_N + shared_col + 0] = tmp.x;
+            Bs[(shared_row) * TILE_N + shared_col + 1] = tmp.y;
+            Bs[(shared_row) * TILE_N + shared_col + 2] = tmp.z;
+            Bs[(shared_row) * TILE_N + shared_col + 3] = tmp.w;
+        }
+
+        __syncthreads();
+
+        for(int dot_idx = 0; dot_idx < TILE_K; dot_idx++) {
+            #pragma unroll
+            for(int elt_idx = 0; elt_idx < MICRO_M; elt_idx++) {
+                // this is actually most complext thing here
+                // similar to 1d, dot_idx runs among cols A
+                // and for rows, we just copy MICRO_M elements (row elements per thread)
+                reg_a[elt_idx] = As[dot_idx * TILE_M + thread_row * MICRO_M + elt_idx];
+            }
+            
+            #pragma unroll
+            for(int elt_idx = 0; elt_idx < MICRO_N; elt_idx++) {
+                // vise versa but for B matrix
+                reg_b[elt_idx] = Bs[dot_idx * TILE_N + thread_col * MICRO_N + elt_idx];
+            }
+
+            // actual matmul on registers here
+            #pragma unroll
+            for(int a_idx = 0; a_idx < MICRO_M; a_idx++) {
+                #pragma unroll
+                for(int b_idx = 0; b_idx < MICRO_N; b_idx++) {
+                    reg_sums[a_idx][b_idx] += reg_a[a_idx] * reg_b[b_idx];
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for(int a_idx = 0; a_idx < MICRO_M; a_idx++) {
+        #pragma unroll
+        for(int b_idx = 0; b_idx < MICRO_N; b_idx++) {
+            int row = block_row + thread_row * MICRO_M + a_idx;
+            int col = block_col + thread_col * MICRO_N + b_idx;
+            if (row < M && col < N) {
+                C[row * ldc + col] = alpha * reg_sums[a_idx][b_idx] + beta * C[row * ldc + col];
+            }
+        }
+    }
+}
+
 // --------------------------------------- Main -------------------------------------------
 
 int main(int argc, char** argv)
@@ -621,6 +740,15 @@ int main(int argc, char** argv)
         dim3 grid_size(CEIL_DIV(N, block_size.x * MICRO_N), CEIL_DIV(M, block_size.y * MICRO_M), 1);
         run_custom_sgemm<sgemm_2D_blocking<64, 64, 8, MICRO_M, MICRO_N>>(
             handle, dA, dB, dC, M, N, K, iters, block_size, grid_size, "2D blocking", verify);
+    }
+
+    {
+        const int MICRO_M = 4;
+        const int MICRO_N = 4;
+        dim3 block_size(16, 16, 1);
+        dim3 grid_size(CEIL_DIV(N, block_size.x * MICRO_N), CEIL_DIV(M, block_size.y * MICRO_M), 1);
+        run_custom_sgemm<sgemm_vectorize_smem<64, 64, 8, MICRO_M, MICRO_N>>(
+            handle, dA, dB, dC, M, N, K, iters, block_size, grid_size, "vectorize shmem", verify);
     }
     
     CHECK_CUBLAS(cublasDestroy(handle));
