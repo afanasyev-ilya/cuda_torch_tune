@@ -880,7 +880,7 @@ double bench_config(cublasHandle_t handle,
     // if (smem > max_smem_per_block) return 0.0;
 
     bool verbose = false;
-    double flops = run_custom_sgemm<sgemm_vectorize_smem<BM, BN, BK, MICRO_M, MICRO_N>>(
+    double flops = run_custom_sgemm<sgemm_db<BM, BN, BK, MICRO_M, MICRO_N>>(
         handle, dA, dB, dC, M, N, K, iters,
         block_size, grid_size,
         "autotune", verify, verbose
@@ -1057,12 +1057,7 @@ int main(int argc, char** argv)
     }
 
     {   
-        std::cout << "Autotuning in process..." << std::endl;
-        auto cfg = autotune_sgemm(handle, dA, dB, dC, M, N, K, iters, verify);
-        std::cout << "done!" << std::endl;
-        std::cout << "best result: " << cfg << std::endl << std::endl;
-
-        // results for RTX 3060
+        // Autotuned results for RTX 3060
         const int BM = 64;
         const int BN = 64;
         const int BK = 8;
@@ -1076,12 +1071,17 @@ int main(int argc, char** argv)
     }
 
     {   
+        std::cout << "Autotuning in process..." << std::endl;
+        auto cfg = autotune_sgemm(handle, dA, dB, dC, M, N, K, iters, verify);
+        std::cout << "done!" << std::endl;
+        std::cout << "best result: " << cfg << std::endl << std::endl;
+
         // results for RTX 3060
-        const int BM = 64;
-        const int BN = 64;
-        const int BK = 8;
+        const int BM = 128;
+        const int BN = 128;
+        const int BK = 16;
         const int MICRO_M = 8;
-        const int MICRO_N = 4;
+        const int MICRO_N = 8;
 
         dim3 block_size(BN/MICRO_N, BM/MICRO_M, 1);
         dim3 grid_size(CEIL_DIV(N, block_size.x * MICRO_N), CEIL_DIV(M, block_size.y * MICRO_M), 1);
