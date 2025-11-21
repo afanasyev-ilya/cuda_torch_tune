@@ -318,8 +318,14 @@ __global__ void sgemm_shared(const float *A,
     float sum = 0.0f;
     
     for (int t = 0; t < num_tiles; t++) {
-        As[thread_row][thread_col] = A[row * K + (thread_col + t*TILE_SIZE)];
-        Bs[thread_row][thread_col] = B[(thread_row + t*TILE_SIZE) * N + col];
+        if(row < M && (thread_col + t*TILE_SIZE) < K)
+            As[thread_row][thread_col] = A[row * K + (thread_col + t*TILE_SIZE)];
+        else
+            As[thread_row][thread_col] = 0;
+        if((thread_row + t*TILE_SIZE) < K && col < N)
+            Bs[thread_row][thread_col] = B[(thread_row + t*TILE_SIZE) * N + col];
+        else
+            Bs[thread_row][thread_col] = 0;
 
         __syncthreads();
 
@@ -367,10 +373,15 @@ __global__ void sgemm_1D_blocking(const float *A,
     for (int t = 0; t < num_tiles; t++) {
         int tile_offset = t * BK;
         // since we have 64*8 = 512 threads and shared memory size is 512, we can copy in one pass without loop
-        As[thread_col][thread_row] = A[(block_row + thread_col) * K + (thread_row + tile_offset)];
+        if((block_row + thread_col) < M && (thread_row + tile_offset) < K)
+            As[thread_col][thread_row] = A[(block_row + thread_col) * K + (thread_row + tile_offset)];
+        else 
+            As[thread_col][thread_row] = 0;
         // B access is coalcesed
-        Bs[thread_row][thread_col] = B[(thread_row + tile_offset) * N + (block_col + thread_col)];
-
+        if((thread_row + tile_offset) < K && (block_col + thread_col) < N)
+            Bs[thread_row][thread_col] = B[(thread_row + tile_offset) * N + (block_col + thread_col)];
+        else
+            Bs[thread_row][thread_col] = 0;
         __syncthreads();
 
         for (int dot_idx = 0; dot_idx < BK; ++dot_idx) {
