@@ -645,6 +645,199 @@ __global__ void sgemm_vectorize_smem(const float *A,
     }
 }
 
+template<int TILE_M, int TILE_N, int TILE_K, int MICRO_M, int MICRO_N>
+__global__ void sgemm_db(const float *A,
+                         const float *B,
+                         float *C,
+                         int M, int N, int K,
+                         float alpha, float beta) {
+    // Thread position within block
+    const int thread_row = threadIdx.y;
+    const int thread_col = threadIdx.x;
+    
+    // Starting coords of output tile for matrix C
+    const int block_row = blockIdx.y * TILE_M;
+    const int block_col = blockIdx.x * TILE_N;
+
+    // leading dims for simplicity
+    const int lda = K;
+    const int ldb = N;
+    const int ldc = N;
+
+    // indexes for loading
+    const int tid        = threadIdx.x + blockDim.x * threadIdx.y;
+    const int block_size = blockDim.x * blockDim.y;
+
+    // double-buffered shared memory: we transpose As
+    __shared__ float As[2][TILE_K * TILE_M];  // [buffer][k * TILE_M + m]
+    __shared__ float Bs[2][TILE_K * TILE_N];  // [buffer][k * TILE_N + n]
+
+    const int num_tiles = (K - 1) / TILE_K + 1;
+
+    float reg_sums[MICRO_M][MICRO_N] = {0.0f};
+    float reg_a[MICRO_M];
+    float reg_b[MICRO_N];
+
+    constexpr int VECTOR_LENGTH = 4;
+
+    // -------------------------
+    // Preload tile 0 into buffer 0
+    // -------------------------
+    int buf = 0;
+    {
+        int tile_offset = 0;
+
+        // copy A for tile 0
+        #pragma unroll
+        for (int i = tid; i < (TILE_M * TILE_K) / VECTOR_LENGTH; i += block_size) {
+            int linear_idx = i * VECTOR_LENGTH;
+            int shared_col = linear_idx % TILE_K;   // [0, TILE_K), stride 4
+            int shared_row = linear_idx / TILE_K;   // [0, TILE_M)
+
+            int global_col = tile_offset + shared_col;
+            int global_row = block_row + shared_row;
+
+            float4 tmp = reinterpret_cast<const float4 *>(
+                &A[global_row * lda + global_col]
+            )[0];
+
+            float *As_buf = &As[buf][0];
+
+            As_buf[(shared_col + 0) * TILE_M + shared_row] = tmp.x;
+            As_buf[(shared_col + 1) * TILE_M + shared_row] = tmp.y;
+            As_buf[(shared_col + 2) * TILE_M + shared_row] = tmp.z;
+            As_buf[(shared_col + 3) * TILE_M + shared_row] = tmp.w;
+        }
+
+        // copy B for tile 0
+        #pragma unroll
+        for (int i = tid; i < (TILE_K * TILE_N) / VECTOR_LENGTH; i += block_size) {
+            int linear_idx = i * VECTOR_LENGTH;
+            int shared_col = linear_idx % TILE_N;   // [0, TILE_N), stride 4
+            int shared_row = linear_idx / TILE_N;   // [0, TILE_K)
+
+            int global_col = block_col + shared_col;
+            int global_row = tile_offset + shared_row;
+
+            float4 tmp = reinterpret_cast<const float4 *>(
+                &B[global_row * ldb + global_col]
+            )[0];
+
+            float *Bs_buf = &Bs[buf][0];
+            int base = shared_row * TILE_N + shared_col;
+            Bs_buf[base + 0] = tmp.x;
+            Bs_buf[base + 1] = tmp.y;
+            Bs_buf[base + 2] = tmp.z;
+            Bs_buf[base + 3] = tmp.w;
+        }
+
+        __syncthreads(); // tile 0 ready
+    }
+
+    // -------------------------
+    // Main loop with double buffering
+    // -------------------------
+    for (int tile_id = 0; tile_id < num_tiles; ++tile_id) {
+        int next_tile = tile_id + 1;
+        int next_buf  = buf ^ 1;
+
+        // Start loading next tile into the other buffer (if any)
+        if (next_tile < num_tiles) {
+            int tile_offset = next_tile * TILE_K;
+
+            // copy A for next tile into As[next_buf]
+            #pragma unroll
+            for (int i = tid; i < (TILE_M * TILE_K) / VECTOR_LENGTH; i += block_size) {
+                int linear_idx = i * VECTOR_LENGTH;
+                int shared_col = linear_idx % TILE_K;
+                int shared_row = linear_idx / TILE_K;
+
+                int global_col = tile_offset + shared_col;
+                int global_row = block_row + shared_row;
+
+                float4 tmp = reinterpret_cast<const float4 *>(
+                    &A[global_row * lda + global_col]
+                )[0];
+
+                float *As_buf = &As[next_buf][0];
+
+                As_buf[(shared_col + 0) * TILE_M + shared_row] = tmp.x;
+                As_buf[(shared_col + 1) * TILE_M + shared_row] = tmp.y;
+                As_buf[(shared_col + 2) * TILE_M + shared_row] = tmp.z;
+                As_buf[(shared_col + 3) * TILE_M + shared_row] = tmp.w;
+            }
+
+            // copy B for next tile into Bs[next_buf]
+            #pragma unroll
+            for (int i = tid; i < (TILE_K * TILE_N) / VECTOR_LENGTH; i += block_size) {
+                int linear_idx = i * VECTOR_LENGTH;
+                int shared_col = linear_idx % TILE_N;
+                int shared_row = linear_idx / TILE_N;
+
+                int global_col = block_col + shared_col;
+                int global_row = tile_offset + shared_row;
+
+                float4 tmp = reinterpret_cast<const float4 *>(
+                    &B[global_row * ldb + global_col]
+                )[0];
+
+                float *Bs_buf = &Bs[next_buf][0];
+                int base = shared_row * TILE_N + shared_col;
+                Bs_buf[base + 0] = tmp.x;
+                Bs_buf[base + 1] = tmp.y;
+                Bs_buf[base + 2] = tmp.z;
+                Bs_buf[base + 3] = tmp.w;
+            }
+        }
+
+        // ---- compute using current buffer (As[buf], Bs[buf]) ----
+        float *As_cur = &As[buf][0];
+        float *Bs_cur = &Bs[buf][0];
+
+        for (int dot_idx = 0; dot_idx < TILE_K; ++dot_idx) {
+            #pragma unroll
+            for (int elt_idx = 0; elt_idx < MICRO_M; ++elt_idx) {
+                reg_a[elt_idx] =
+                    As_cur[dot_idx * TILE_M +
+                           thread_row * MICRO_M + elt_idx];
+            }
+
+            #pragma unroll
+            for (int elt_idx = 0; elt_idx < MICRO_N; ++elt_idx) {
+                reg_b[elt_idx] =
+                    Bs_cur[dot_idx * TILE_N +
+                           thread_col * MICRO_N + elt_idx];
+            }
+
+            #pragma unroll
+            for (int a_idx = 0; a_idx < MICRO_M; ++a_idx) {
+                #pragma unroll
+                for (int b_idx = 0; b_idx < MICRO_N; ++b_idx) {
+                    reg_sums[a_idx][b_idx] +=
+                        reg_a[a_idx] * reg_b[b_idx];
+                }
+            }
+        }
+
+        __syncthreads(); // ensure next tile (if any) is fully loaded
+        buf = next_buf;
+    }
+
+    #pragma unroll
+    for (int a_idx = 0; a_idx < MICRO_M; ++a_idx) {
+        #pragma unroll
+        for (int b_idx = 0; b_idx < MICRO_N; ++b_idx) {
+            int row = block_row + thread_row * MICRO_M + a_idx;
+            int col = block_col + thread_col * MICRO_N + b_idx;
+            if (row < M && col < N) {
+                C[row * ldc + col] =
+                    alpha * reg_sums[a_idx][b_idx] +
+                    beta  * C[row * ldc + col];
+            }
+        }
+    }
+}
+
 // ---------------------------------------
 
 struct Config {
@@ -738,7 +931,6 @@ Config autotune_sgemm(cublasHandle_t handle,
 
     return best;
 }
-
 
 // --------------------------------------- Main -------------------------------------------
 
@@ -881,6 +1073,20 @@ int main(int argc, char** argv)
         dim3 grid_size(CEIL_DIV(N, block_size.x * MICRO_N), CEIL_DIV(M, block_size.y * MICRO_M), 1);
         run_custom_sgemm<sgemm_vectorize_smem<BM, BN, BK, MICRO_M, MICRO_N>>(
             handle, dA, dB, dC, M, N, K, iters, block_size, grid_size, "autotune", verify);
+    }
+
+    {   
+        // results for RTX 3060
+        const int BM = 64;
+        const int BN = 64;
+        const int BK = 8;
+        const int MICRO_M = 8;
+        const int MICRO_N = 4;
+
+        dim3 block_size(BN/MICRO_N, BM/MICRO_M, 1);
+        dim3 grid_size(CEIL_DIV(N, block_size.x * MICRO_N), CEIL_DIV(M, block_size.y * MICRO_M), 1);
+        run_custom_sgemm<sgemm_db<BM, BN, BK, MICRO_M, MICRO_N>>(
+            handle, dA, dB, dC, M, N, K, iters, block_size, grid_size, "double buffering(DB)", verify);
     }
     
     CHECK_CUBLAS(cublasDestroy(handle));
