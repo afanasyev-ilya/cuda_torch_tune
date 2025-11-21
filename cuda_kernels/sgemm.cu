@@ -153,19 +153,19 @@ using KernelFunc = void(*)(const float*,
                            int, int, int, float, float);
 
 template <KernelFunc GemmKernel>
-void run_custom_sgemm(cublasHandle_t handle,
-                      const float* dA, 
-                      const float* dB, 
-                      float* dC,
-                      int M,
-                      int N,
-                      int K,
-                      int iters,
-                      dim3 block_size,
-                      dim3 grid_size,
-                      std::string name,
-                      bool verify = true)
-{
+double run_custom_sgemm(cublasHandle_t handle,
+                        const float* dA, 
+                        const float* dB, 
+                        float* dC,
+                        int M,
+                        int N,
+                        int K,
+                        int iters,
+                        dim3 block_size,
+                        dim3 grid_size,
+                        std::string name,
+                        bool verify = true)
+    {
     float alpha = 1.0;
     float betta = 1.0;
 
@@ -247,6 +247,7 @@ void run_custom_sgemm(cublasHandle_t handle,
     double tflops = flops / (avg_ms * 1e-3) / 1e12;
 
     std::cout << "[" << name << "]\navg time: " << avg_ms << " ms,\n   " << tflops << " TFLOP/s" << std::endl << std::endl;
+    return tflops;
 }
 
 // --------------------------------------- Main -------------------------------------------
@@ -633,6 +634,72 @@ __global__ void sgemm_vectorize_smem(const float *A,
     }
 }
 
+// ---------------------------------------
+
+struct Config {
+    int BM, BN, BK, MICRO_M, MICRO_N;
+    double flops;
+};
+
+template<int BM, int BN, int BK, int MICRO_M, int MICRO_N>
+double bench_config(cublasHandle_t handle,
+                    const float* dA, const float* dB, float* dC,
+                    int M, int N, int K, int iters, bool verify)
+{
+    static_assert(BN % MICRO_N == 0, "BN % MICRO_N != 0");
+    static_assert(BM % MICRO_M == 0, "BM % MICRO_M != 0");
+
+    dim3 block_size(BN / MICRO_N, BM / MICRO_M, 1);
+    int threads = block_size.x * block_size.y;
+    if (threads > 1024) return 0.0;  // invalid on many GPUs
+
+    dim3 grid_size(
+        CEIL_DIV(N, block_size.x * MICRO_N),
+        CEIL_DIV(M, block_size.y * MICRO_M),
+        1
+    );
+
+    // Optional: shared mem check (BM+BN)*BK*sizeof(float) etc.
+    // size_t smem = (BM * BK + BK * BN) * sizeof(float);
+    // if (smem > max_smem_per_block) return 0.0;
+
+    double flops = run_custom_sgemm<sgemm_vectorize_smem<BM, BN, BK, MICRO_M, MICRO_N>>(
+        handle, dA, dB, dC, M, N, K, iters,
+        block_size, grid_size,
+        "autotune", verify
+    );
+    return flops;
+}
+
+Config autotune_sgemm(cublasHandle_t handle,
+                      const float* dA, const float* dB, float* dC,
+                      int M, int N, int K, int iters, bool verify)
+{
+    Config best {0,0,0,0,0,0.0};
+
+    auto update = [&](int BM, int BN, int BK, int MM, int NN, double flops) {
+        if (flops > best.flops) {
+            best = {BM, BN, BK, MM, NN, flops};
+        }
+    };
+
+    // macro to instantiate + benchmark one config
+    #define TRY(BM, BN, BK, MM, NN) do {                           \
+        double g = bench_config<BM, BN, BK, MM, NN>(               \
+            handle, dA, dB, dC, M, N, K, iters, verify);           \
+        update(BM, BN, BK, MM, NN, g);                             \
+    } while (0)
+
+    // ---- candidate set (example, see section 2 below) ----
+    TRY( 64,  64,  8,  4,  4);
+    // ... add more as needed
+
+    #undef TRY
+
+    return best;
+}
+
+
 // --------------------------------------- Main -------------------------------------------
 
 int main(int argc, char** argv)
@@ -757,16 +824,9 @@ int main(int argc, char** argv)
             handle, dA, dB, dC, M, N, K, iters, block_size, grid_size, "vectorize shmem", verify);
     }
 
-    {
-        const int BM = 128;
-        const int BN = 128;
-        const int BK = 16;
-        const int MICRO_M = 8;
-        const int MICRO_N = 8;
-        dim3 block_size(BN/MICRO_N, BM/MICRO_M, 1);
-        dim3 grid_size(CEIL_DIV(N, block_size.x * MICRO_N), CEIL_DIV(M, block_size.y * MICRO_M), 1);
-        run_custom_sgemm<sgemm_vectorize_smem<BM, BN, BK, MICRO_M, MICRO_N>>(
-            handle, dA, dB, dC, M, N, K, iters, block_size, grid_size, "autotune", verify);
+    {   
+        auto best_config = autotune_sgemm(handle, dA, dB, dC, M, N, K, iters, verify);
+        std::cout << best_config.flops << std::endl;
     }
     
     CHECK_CUBLAS(cublasDestroy(handle));
