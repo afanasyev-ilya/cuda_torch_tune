@@ -440,7 +440,10 @@ __global__ void sgemm_2D_blocking(const float *A,
 
             int global_col = tile_offset + shared_col;
             int global_row = block_row + shared_row;
-            As[shared_row][shared_col] = A[global_row * lda + global_col];
+            float val = 0.0f;
+            if(global_col < K && global_row < M)
+                val = A[global_row * lda + global_col];
+            As[shared_row][shared_col] = val;
         }
 
         // copy B
@@ -449,9 +452,12 @@ __global__ void sgemm_2D_blocking(const float *A,
             int shared_col = i % TILE_N; // changes in range of [0, TILE_N]
             int shared_row = i / TILE_N; // changes in range of [0, TILE_K]
 
-            int global_col = block_row + shared_col;
+            int global_col = block_col + shared_col;
             int global_row = tile_offset + shared_row;
-            Bs[shared_row][shared_col] = B[global_row * ldb + global_col];
+            float val = 0.0f;
+            if(global_col < N && global_row < K)
+                val = B[global_row * ldb + global_col];
+            Bs[shared_row][shared_col] = val;
         }
 
         __syncthreads();
