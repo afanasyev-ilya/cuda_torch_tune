@@ -122,7 +122,7 @@ void run_cublas_gemm(cublasHandle_t handle, int M, int N, int K, const float* dA
     double flops = 2.0 * double(M) * double(N) * double(K);
     double tflops = flops / (avg_ms * 1e-3) / 1e12;
 
-    std::cout << "[cuBLAS SGEMM] avg time: " << avg_ms << " ms,  TFLOP/s: " << tflops << std::endl << std::endl;
+    std::cout << "[cuBLAS SGEMM]\navg time: " << avg_ms << " ms, \n   TFLOP/s: " << tflops << std::endl << std::endl;
 }
 
 // -------------------------- wrappers and verification --------------------------
@@ -246,7 +246,7 @@ void run_custom_sgemm(cublasHandle_t handle,
     double flops = 2.0 * double(M) * double(N) * double(K);
     double tflops = flops / (avg_ms * 1e-3) / 1e12;
 
-    std::cout << "[" << name << "] avg time: " << avg_ms << " ms,  TFLOP/s: " << tflops << std::endl << std::endl;
+    std::cout << "[" << name << "]\navg time: " << avg_ms << " ms,\n   " << tflops << " TFLOP/s" << std::endl << std::endl;
 }
 
 // --------------------------------------- Main -------------------------------------------
@@ -362,7 +362,7 @@ __global__ void sgemm_1D_blocking(const float *A,
     const int num_tiles = (K - 1) / BK + 1;
 
     // ELEM_PER_THREAD = 64 / 8 = BM / block_size.y
-    float sums[ELEM_PER_THREAD] = {0.0f};
+    float sums[ELEM_PER_THREAD] = {0};
     
     for (int t = 0; t < num_tiles; t++) {
         int tile_offset = t * BK;
@@ -397,7 +397,58 @@ __global__ void sgemm_1D_blocking(const float *A,
 
 // ---------------------------------------
 
+// MICRO_M * MICRO_K = elt per thread
+template<int TILE_M, int TILE_N, int TILE_K, int MICRO_M, int MICRO_N>
+__global__ void sgemm_2D_blocking(const float *A,
+                                  const float *B, 
+                                  float *C, 
+                                  int M, int N, int K,
+                                  float alpha, float beta) {
+    // Thread position within block
+    const int thread_row = threadIdx.y; // should be 0, 8
+    const int thread_col = threadIdx.x; // should be 0, 8
+    
+    // Starting coords of 64x64 output tile for matrix C
+    const int block_row = blockIdx.y * TILE_M;
+    const int block_col = blockIdx.x * TILE_N;
 
+    // ldas for simplicity
+    const int lda = K;
+    const int ldb = N;
+    const int ldc = N;
+
+    // indexes for loading
+    const int tid = threadIdx.x + blockDim.x * threadIdx.y;
+    const int block_size = blockDim.x * blockDim.y;
+
+    __shared__ float As[TILE_M][TILE_K];
+    __shared__ float Bs[TILE_K][TILE_N];
+
+    const int num_tiles = (K - 1) / TILE_K + 1;
+
+    float reg_sums[MICRO_M][MICRO_N] = {0};
+    
+    for (int tile_id = 0; tile_id < num_tiles; tile_id++) {
+        int tile_offset = tile_id * TILE_K;
+        // copy A
+        for(int i = tid; i < TILE_M*TILE_K; i += block_size) {
+            int shared_col = i % TILE_K; // changes in range of [0, TILE_K]
+            int shared_row = i / TILE_K; // changes in range of [0, TILE_M]
+
+            int global_col = tile_offset + shared_col;
+            int global_row = block_row + shared_row;
+            As[shared_row][shared_col] = A[global_row * lda + global_col];
+        }
+
+        __syncthreads();
+
+        // mult
+
+        __syncthreads();
+    }
+
+    
+}
 
 // --------------------------------------- Main -------------------------------------------
 
@@ -498,6 +549,15 @@ int main(int argc, char** argv)
     run_1d_blocking.operator()<8>();
     run_1d_blocking.operator()<16>();
     run_1d_blocking.operator()<32>();
+
+    {
+        const int MICRO_M = 4;
+        const int MICRO_N = 4;
+        dim3 block_size(16, 16, 1);
+        dim3 grid_size(CEIL_DIV(N, block_size.x * MICRO_N), CEIL_DIV(M, block_size.y * MICRO_M), 1);
+        run_custom_sgemm<sgemm_2D_blocking<64, 64, 8, MICRO_M, MICRO_N>>(
+            handle, dA, dB, dC, M, N, K, iters, block_size, grid_size, "2D blocking", verify);
+    }
     
     CHECK_CUBLAS(cublasDestroy(handle));
 
