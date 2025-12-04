@@ -1030,10 +1030,6 @@ double bench_config(cublasHandle_t handle,
         1
     );
 
-    // Optional: shared mem check (BM+BN)*BK*sizeof(float) etc.
-    // size_t smem = (BM * BK + BK * BN) * sizeof(float);
-    // if (smem > max_smem_per_block) return 0.0;
-
     bool verbose = false;
     double flops = run_custom_sgemm<sgemm_vectorize_smem<BM, BN, BK, MICRO_M, MICRO_N>>(
         handle, dA, dB, dC, M, N, K, iters,
@@ -1219,10 +1215,10 @@ int main(int argc, char** argv)
 
     // do autotuning
     {   
-        /*std::cout << "Autotuning in process..." << std::endl;
+        std::cout << "Autotuning in process..." << std::endl;
         auto cfg = autotune_sgemm(handle, dA, dB, dC, M, N, K, iters, verify);
         std::cout << "done!" << std::endl;
-        std::cout << "best result: " << cfg << std::endl << std::endl;*/
+        std::cout << "best result: " << cfg << std::endl << std::endl;
 
         // Autotuned results for RTX 3060
         const int BM = 64;
@@ -1250,7 +1246,7 @@ int main(int argc, char** argv)
         dim3 block_size(BN/TN, BM/TM, 1);
         dim3 grid_size(CEIL_DIV(N, block_size.x * TN), CEIL_DIV(M, block_size.y * TM), 1);
         run_custom_sgemm<sgemm_warp_tiling<BM, BN, BK, WM, WN, TM, TN>>(
-            handle, dA, dB, dC, M, N, K, iters, block_size, grid_size, "warp tiling DRAFT", verify);
+            handle, dA, dB, dC, M, N, K, iters, block_size, grid_size, "warp tiling", verify);
     }
 
     {   
