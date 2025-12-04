@@ -15,6 +15,9 @@
 //
 // Build example (adjust paths & arch as needed):
 //   nvcc -O3 -std=c++17 fp_16_gemm.cu -o fp16_gemm_bench -I ~/cutlass/include -lcublas -arch=sm_86
+// How to profile:
+// sudo /usr/local/cuda-12.3/bin/ncu  --set full --kernel-name "gemm_warp_tensorcore" ./fp16_gemm_bench
+
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
@@ -694,7 +697,7 @@ gemm_warp_tensorcore(const __nv_bfloat16* __restrict__ A,
                         int gc = col + j;
                         if (gc >= N) break;
                         int idx = gr * ldc + gc;
-                        C[idx] = 1.0 * C[idx] + 0.0 * C[idx]; // adjust logic as desired
+                        C[idx] = 1.0 * C[idx] + 0.0 * C[idx];
                     }
                 }
             }
@@ -714,7 +717,7 @@ int main(int argc, char** argv)
     int M = size_sq;
     int N = size_sq;
     int K = size_sq;
-    int iters = 10;
+    int iters = 2;
 
     std::cout << "GEMM benchmark: C = A * B (row-major FP32)\n";
     std::cout << "  M = " << M << ", N = " << N << ", K = " << K
