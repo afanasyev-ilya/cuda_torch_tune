@@ -665,8 +665,6 @@ __global__ void sgemm_vectorize_smem(const float * __restrict__ A,
 // WM = Warp M  (number of matrix element processed by warp), e.g. 32
 // TM = Thread M (number of thread elements processed by thread), e.g. 8
 // since 32 (warp size) is not SQRT, we need to have rectangular WM tile size, usually 64x32 or 32x64
-// we also need to paramerrise, how warp threads split 64x32 tile. For example, each thread may process 8x8 adj tile, or 1x32.
-// this is why we have to introduce 2 additional parameters, related to warp
 template<int BM, int BN, int BK, int WM, int WN, int TM, int TN>
 __global__ void 
 __launch_bounds__(256)
@@ -692,14 +690,16 @@ sgemm_warp_tiling(const float * __restrict__ A,
     const int warp_id = tid / WARP_SIZE;
     const int lane_id = tid % WARP_SIZE;
 
-    const int W_ITER_M = BM / WM;
+    // seems like only one is needed
+    //const int W_ITER_M = BM / WM;
     const int W_ITER_N = BN / WN;
 
     const int warp_row = warp_id / W_ITER_N;
     const int warp_col = warp_id % W_ITER_N;
-    const int threadsPerWarpRow = WN / TN;
-    const int threadRowInWarp = lane_id / threadsPerWarpRow;
-    const int threadColInWarp = lane_id % threadsPerWarpRow;
+    // each thread processes TN by single DIM, simple division
+    const int threads_per_warp_row = WN / TN;
+    const int thread_row_in_warp = lane_id / threads_per_warp_row;
+    const int thread_col_in_warp = lane_id % threads_per_warp_row;
 
     // change: we transposed As here
     __shared__ float As[BK][BM];
@@ -753,10 +753,8 @@ sgemm_warp_tiling(const float * __restrict__ A,
 
         __syncthreads();
 
-        //const int my_row_in_shared = thread_row * TM;
-        //const int my_col_in_shared = thread_col * TN;
-        int my_row_in_shared = (warp_row * WM) + (threadRowInWarp * TM);
-        int my_col_in_shared = (warp_col * WN) + (threadColInWarp * TN);
+        int my_row_in_shared = (warp_row * WM) + (thread_row_in_warp * TM);
+        int my_col_in_shared = (warp_col * WN) + (thread_col_in_warp * TN);
 
         for(int dot_idx = 0; dot_idx < BK; dot_idx++) {
             #pragma unroll
@@ -790,10 +788,9 @@ sgemm_warp_tiling(const float * __restrict__ A,
     for(int m = 0; m < TM; m++) {
         #pragma unroll
         for(int n = 0; n < TN; n++) {
-            //int row = block_row + thread_row * TM + a_idx;
-            //int col = block_col + thread_col * TN + b_idx;
-            int row = block_row + (warp_row * WM) + (threadRowInWarp * TM) + m;
-            int col = block_col + (warp_col * WN) + (threadColInWarp * TN) + n;
+            // just simple nested indexing, like ib grid/block
+            int row = block_row + (warp_row * WM) + (thread_row_in_warp * TM) + m;
+            int col = block_col + (warp_col * WN) + (thread_col_in_warp * TN) + n;
             if (row < M && col < N) {
                 C[row * ldc + col] = alpha * reg_sums[m][n] + beta * C[row * ldc + col];
             }
