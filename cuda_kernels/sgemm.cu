@@ -1013,9 +1013,9 @@ void static_for(ValueList<Is...>, Func&& f) {
     (f.template operator()<Is>(), ...);
 }
 
-inline constexpr int quite_autotune = true;
+inline constexpr int quite_autotune = false;
 
-#define LARGE_AUTOTUNE_SEARCH_SPACE
+//#define LARGE_AUTOTUNE_SEARCH_SPACE
 
 #ifdef LARGE_AUTOTUNE_SEARCH_SPACE
 // Block sizes to try
@@ -1033,11 +1033,11 @@ using TNs  = ValueList<1, 2, 4, 8, 16, 32>;
 #else
 using BMs  = ValueList<64, 128>;
 using BNs  = ValueList<64, 128>;
-using BKs  = ValueList<8>;
+using BKs  = ValueList<8, 16>;
 
 // Warp sizes to try
-using WMs  = ValueList<32, 64>;
-using WNs  = ValueList<32, 64>;
+using WMs  = ValueList<16, 32, 64>;
+using WNs  = ValueList<16, 32, 64>;
 
 // Thread sizes to try
 using TMs  = ValueList<4, 8>;
