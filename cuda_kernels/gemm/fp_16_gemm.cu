@@ -560,8 +560,6 @@ gemm_warp_tensorcore(const __nv_bfloat16* __restrict__ A,
     // warp tiling in the block
     constexpr int WARPS_PER_BLOCK_M = BM / WM;
     constexpr int WARPS_PER_BLOCK_N = BN / WN;
-    /*static_assert(WARPS_PER_BLOCK_M * WARPS_PER_BLOCK_N * WARP_SIZE == blockDim.x * blockDim.y,
-                  "Block shape must match warp tiling");*/
 
     const int warp_row = warp_id / WARPS_PER_BLOCK_N;
     const int warp_col = warp_id % WARPS_PER_BLOCK_N;
@@ -685,8 +683,7 @@ gemm_warp_tensorcore(const __nv_bfloat16* __restrict__ A,
                 float* c_ptr = &C[row * ldc + col];
 
                 // Write MMA tile into global C (row-major)
-                wmma::store_matrix_sync(c_ptr, c_frags[mi][nj],
-                                        ldc, wmma::mem_row_major);
+                wmma::store_matrix_sync(c_ptr, c_frags[mi][nj], ldc, wmma::mem_row_major);
 
                 // Apply alpha/beta if you want it fused here:
                 // (simplest: post-process in-place)

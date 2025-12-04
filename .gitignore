@@ -2,3 +2,5 @@ cnn/data
 *__pycache__*
 MoE/venv_pytorch
 cnn/*.pt
+cuda_kernels/gemm/fp16_gemm_bench
+cuda_kernels/gemm/gemm_bench
