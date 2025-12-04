@@ -13,6 +13,8 @@
 
 double BASELINE_TFLOPS = 1;
 
+//#define LARGE_AUTOTUNE_SEARCH_SPACE
+
 // ----------------- Helpers & macros -----------------
 
 #define CHECK_CUDA(call)                                               \
@@ -1184,6 +1186,7 @@ ConfigWarpTiling autotune_sgemm_wt(cublasHandle_t handle,
         }
     };
 
+    #ifdef LARGE_AUTOTUNE_SEARCH_SPACE
     // Block sizes to try
     using BMs  = ValueList<64, 128>;
     using BNs  = ValueList<64, 128>;
@@ -1194,8 +1197,21 @@ ConfigWarpTiling autotune_sgemm_wt(cublasHandle_t handle,
     using WNs  = ValueList<16, 32, 64>;
     
     // Thread sizes to try
+    using TMs  = ValueList<1, 2, 4, 8, 16, 32>;
+    using TNs  = ValueList<1, 2, 4, 8, 16, 32>;
+    #else
+    using BMs  = ValueList<64, 128>;
+    using BNs  = ValueList<64, 128>;
+    using BKs  = ValueList<8>;
+    
+    // Warp sizes to try
+    using WMs  = ValueList<32, 64>;
+    using WNs  = ValueList<32, 64>;
+    
+    // Thread sizes to try
     using TMs  = ValueList<4, 8>;
     using TNs  = ValueList<4, 8>;
+    #endif
 
     static_for(BMs{}, [&]<int BM>() {
         static_for(BNs{}, [&]<int BN>() {
@@ -1354,10 +1370,10 @@ int main(int argc, char** argv)
 
     // do autotuning
     {   
-        std::cout << "Autotuning in process..." << std::endl;
+        /*std::cout << "Autotuning in process..." << std::endl;
         auto cfg = autotune_sgemm(handle, dA, dB, dC, M, N, K, iters, verify);
         std::cout << "done!" << std::endl;
-        std::cout << "best result: " << cfg << std::endl << std::endl;
+        std::cout << "best result: " << cfg << std::endl << std::endl;*/
 
         // Autotuned results for RTX 3060
         const int BM = 64;
@@ -1384,8 +1400,8 @@ int main(int argc, char** argv)
         const int BK = 16;
         const int WM = 64;
         const int WN = 32;
-        const int TM = 8;
-        const int TN = 8;
+        const int TM = 16;
+        const int TN = 4;
 
         dim3 block_size(BN/TN, BM/TM, 1);
         dim3 grid_size(CEIL_DIV(N, block_size.x * TN), CEIL_DIV(M, block_size.y * TM), 1);
