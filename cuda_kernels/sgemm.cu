@@ -660,7 +660,14 @@ __global__ void sgemm_vectorize_smem(const float * __restrict__ A,
 
 // ---------------------------------------
 
-template<int BM, int BN, int BK, int TM, int TN>
+// we swap notation here, since now we have nested tiling
+// BM = Block M (number of matrix element processed by block), e.g. 128
+// WM = Warp M  (number of matrix element processed by warp), e.g. 32
+// TM = Thread M (number of thread elements processed by thread), e.g. 8
+// since 32 (warp size) is not SQRT, we need to have rectangular WM tile size, usually 64x32 or 32x64
+// we also need to paramerrise, how warp threads split 64x32 tile. For example, each thread may process 8x8 adj tile, or 1x32.
+// this is why we have to introduce 2 additional parameters, related to warp
+template<int BM, int BN, int BK, int WM, int WN, int TM, int TN>
 __global__ void 
 __launch_bounds__(256)
 sgemm_warp_tiling(const float * __restrict__ A,
@@ -668,10 +675,6 @@ sgemm_warp_tiling(const float * __restrict__ A,
                                   float * __restrict__  C,
                                   int M, int N, int K,
                                   float alpha, float beta) {
-    // Thread position within block
-    const int thread_row = threadIdx.y;
-    const int thread_col = threadIdx.x;
-    
     // Starting coords of output tile for matrix C
     const int block_row = blockIdx.y * BM;
     const int block_col = blockIdx.x * BN;
@@ -684,15 +687,13 @@ sgemm_warp_tiling(const float * __restrict__ A,
     // indexes for loading
     const int tid = threadIdx.x + blockDim.x * threadIdx.y;
     const int block_size = blockDim.x * blockDim.y;
+    constexpr int WARP_SIZE = 32;
 
-    const int warp_id = tid / 32;
-    const int lane_id = tid % 32;
+    const int warp_id = tid / WARP_SIZE;
+    const int lane_id = tid % WARP_SIZE;
 
-    const int W_ITER_M = 2;
-    const int W_ITER_N = 2;
-
-    const int WM = BM / W_ITER_M;
-    const int WN = BN / W_ITER_N;
+    const int W_ITER_M = BM / WM;
+    const int W_ITER_N = BN / WN;
 
     const int warp_row = warp_id / W_ITER_N;
     const int warp_col = warp_id % W_ITER_N;
@@ -752,10 +753,10 @@ sgemm_warp_tiling(const float * __restrict__ A,
 
         __syncthreads();
 
-        const int my_row_in_shared = thread_row * TM;
-        const int my_col_in_shared = thread_col * TN;
-        //int my_row_in_shared = (warpRow * WM) + (threadRowInWarp * TM);
-        //int my_col_in_shared = (warpCol * WN) + (threadColInWarp * TN);
+        //const int my_row_in_shared = thread_row * TM;
+        //const int my_col_in_shared = thread_col * TN;
+        int my_row_in_shared = (warp_row * WM) + (threadRowInWarp * TM);
+        int my_col_in_shared = (warp_col * WN) + (threadColInWarp * TN);
 
         for(int dot_idx = 0; dot_idx < BK; dot_idx++) {
             #pragma unroll
@@ -786,13 +787,15 @@ sgemm_warp_tiling(const float * __restrict__ A,
     }
 
     #pragma unroll
-    for(int a_idx = 0; a_idx < TM; a_idx++) {
+    for(int m = 0; m < TM; m++) {
         #pragma unroll
-        for(int b_idx = 0; b_idx < TN; b_idx++) {
-            int row = block_row + thread_row * TM + a_idx;
-            int col = block_col + thread_col * TN + b_idx;
+        for(int n = 0; n < TN; n++) {
+            //int row = block_row + thread_row * TM + a_idx;
+            //int col = block_col + thread_col * TN + b_idx;
+            int row = block_row + (warp_row * WM) + (threadRowInWarp * TM) + m;
+            int col = block_col + (warp_col * WN) + (threadColInWarp * TN) + n;
             if (row < M && col < N) {
-                C[row * ldc + col] = alpha * reg_sums[a_idx][b_idx] + beta * C[row * ldc + col];
+                C[row * ldc + col] = alpha * reg_sums[m][n] + beta * C[row * ldc + col];
             }
         }
     }
@@ -1067,10 +1070,6 @@ Config autotune_sgemm(cublasHandle_t handle,
     TRY( 64,  64,  8,  8,  4);
     TRY( 64,  64,  8,  4,  8);
 
-    TRY( 64,  64,  16,  4,  4);
-    TRY( 64,  64,  16,  8,  4);
-    TRY( 64,  64,  16,  4,  8);
-
     TRY(128, 128,  8,  4,  4);
     TRY(128, 128,  8,  8,  4);
     TRY(128, 128,  8,  4,  8);
@@ -1246,12 +1245,14 @@ int main(int argc, char** argv)
         const int BM = 128;
         const int BN = 128;
         const int BK = 16;
+        const int WM = 64;
+        const int WN = 32;
         const int TM = 8;
         const int TN = 8;
 
         dim3 block_size(BN/TN, BM/TM, 1);
         dim3 grid_size(CEIL_DIV(N, block_size.x * TN), CEIL_DIV(M, block_size.y * TM), 1);
-        run_custom_sgemm<sgemm_warp_tiling<BM, BN, BK, TM, TN>>(
+        run_custom_sgemm<sgemm_warp_tiling<BM, BN, BK, WM, WN, TM, TN>>(
             handle, dA, dB, dC, M, N, K, iters, block_size, grid_size, "warp tiling DRAFT", verify);
     }
 
