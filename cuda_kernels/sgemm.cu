@@ -13,8 +13,6 @@
 
 double BASELINE_TFLOPS = 1;
 
-//#define LARGE_AUTOTUNE_SEARCH_SPACE
-
 // ----------------- Helpers & macros -----------------
 
 #define CHECK_CUDA(call)                                               \
@@ -1115,6 +1113,36 @@ Config autotune_sgemm(cublasHandle_t handle,
 // ditto for warp tiling
 // have to boilerplate because of additonal WM/WN params
 
+
+#define LARGE_AUTOTUNE_SEARCH_SPACE
+
+#ifdef LARGE_AUTOTUNE_SEARCH_SPACE
+// Block sizes to try
+using BMs  = ValueList<64, 128>;
+using BNs  = ValueList<64, 128>;
+using BKs  = ValueList<8, 16>;
+
+// Warp sizes to try
+using WMs  = ValueList<16, 32, 64>;
+using WNs  = ValueList<16, 32, 64>;
+
+// Thread sizes to try
+using TMs  = ValueList<1, 2, 4, 8, 16, 32>;
+using TNs  = ValueList<1, 2, 4, 8, 16, 32>;
+#else
+using BMs  = ValueList<64, 128>;
+using BNs  = ValueList<64, 128>;
+using BKs  = ValueList<8>;
+
+// Warp sizes to try
+using WMs  = ValueList<32, 64>;
+using WNs  = ValueList<32, 64>;
+
+// Thread sizes to try
+using TMs  = ValueList<4, 8>;
+using TNs  = ValueList<4, 8>;
+#endif
+
 struct ConfigWarpTiling {
     int BM, BN, BK, WM, WN, TM, TN;
     double flops;
@@ -1140,8 +1168,12 @@ double bench_config_wt(cublasHandle_t handle,
                        int M, int N, int K, int iters, bool verify)
 {
     try {
-        static_assert(BN % TN == 0, "BN % MICRO_N != 0");
-        static_assert(BM % TM == 0, "BM % MICRO_M != 0");
+        static_assert(BN % TN == 0, "BN % TN != 0");
+        static_assert(BM % TM == 0, "BM % TM != 0");
+        /*static_assert(BN % WN == 0, "BN % WN != 0");
+        static_assert(BM % WM == 0, "BM % WM != 0");
+        static_assert(WN % TM == 0, "WN % TM != 0");
+        static_assert(WM % TM == 0, "WM % TM != 0");*/
 
         dim3 block_size(BN / TN, BM / TM, 1);
         int threads = block_size.x * block_size.y;
@@ -1186,33 +1218,6 @@ ConfigWarpTiling autotune_sgemm_wt(cublasHandle_t handle,
         }
     };
 
-    #ifdef LARGE_AUTOTUNE_SEARCH_SPACE
-    // Block sizes to try
-    using BMs  = ValueList<64, 128>;
-    using BNs  = ValueList<64, 128>;
-    using BKs  = ValueList<8, 16>;
-    
-    // Warp sizes to try
-    using WMs  = ValueList<16, 32, 64>;
-    using WNs  = ValueList<16, 32, 64>;
-    
-    // Thread sizes to try
-    using TMs  = ValueList<1, 2, 4, 8, 16, 32>;
-    using TNs  = ValueList<1, 2, 4, 8, 16, 32>;
-    #else
-    using BMs  = ValueList<64, 128>;
-    using BNs  = ValueList<64, 128>;
-    using BKs  = ValueList<8>;
-    
-    // Warp sizes to try
-    using WMs  = ValueList<32, 64>;
-    using WNs  = ValueList<32, 64>;
-    
-    // Thread sizes to try
-    using TMs  = ValueList<4, 8>;
-    using TNs  = ValueList<4, 8>;
-    #endif
-
     static_for(BMs{}, [&]<int BM>() {
         static_for(BNs{}, [&]<int BN>() {
             static_for(BKs{}, [&]<int BK>() {
@@ -1240,6 +1245,48 @@ ConfigWarpTiling autotune_sgemm_wt(cublasHandle_t handle,
     });
 
     return best;
+}
+
+template<typename Cfg>
+void run_autotuned_with_static_for(const Cfg& cfg,
+                                   cublasHandle_t handle,
+                                   const float* dA, const float* dB, float* dC,
+                                   int M, int N, int K,
+                                   int iters, std::string name, bool verify)
+{
+    bool launched = false;
+
+    static_for(BMs{}, [&]<int BM>() {
+        static_for(BNs{}, [&]<int BN>() {
+            static_for(BKs{}, [&]<int BK>() {
+                static_for(WMs{}, [&]<int WM>() {
+                    static_for(WNs{}, [&]<int WN>() {
+                        static_for(TMs{}, [&]<int TM>() {
+                            static_for(TNs{}, [&]<int TN>() {
+                                constexpr bool threads_fit = ((BM * BN) / (TM * TN)) <= 256;
+                                constexpr bool warp_valid  = (WM / TM) * (WN / TN) == 32;
+                                constexpr bool warp_fits_block = (BM >= WM) && (BN >= WN);
+
+                                if constexpr (threads_fit && warp_valid && warp_fits_block) {
+                                    if (cfg.BM == BM && cfg.BN == BN && cfg.BK == BK && cfg.WM == WM && cfg.WN == WN && cfg.TM == TM && cfg.TN == TN) {
+                                        dim3 block_size(BN/TN, BM/TM, 1);
+                                        dim3 grid_size(CEIL_DIV(N, block_size.x * TN), CEIL_DIV(M, block_size.y * TM), 1);
+                                        run_custom_sgemm<sgemm_warp_tiling<BM, BN, BK, WM, WN, TM, TN>>(
+                                            handle, dA, dB, dC, M, N, K, iters, block_size, grid_size, name, verify);
+                                        launched = true;
+                                    }
+                                }
+                            });
+                        });
+                    });
+                });
+            });
+        });
+    });
+
+    if (!launched) {
+        throw std::runtime_error("Autotuned cfg is not in the compiled search space");
+    }
 }
 
 // --------------------------------------- Main -------------------------------------------
@@ -1373,7 +1420,7 @@ int main(int argc, char** argv)
         /*std::cout << "Autotuning in process..." << std::endl;
         auto cfg = autotune_sgemm(handle, dA, dB, dC, M, N, K, iters, verify);
         std::cout << "done!" << std::endl;
-        std::cout << "best result: " << cfg << std::endl << std::endl;*/
+        std::cout << "best config: " << cfg << std::endl << std::endl;*/
 
         // Autotuned results for RTX 3060
         const int BM = 64;
@@ -1392,21 +1439,9 @@ int main(int argc, char** argv)
         std::cout << "WARP TILING Autotuning in process..." << std::endl;
         auto cfg = autotune_sgemm_wt(handle, dA, dB, dC, M, N, K, iters, verify);
         std::cout << "done!" << std::endl;
-        std::cout << "wt best result: " << cfg << std::endl << std::endl;
+        std::cout << "warp tiling best config: " << cfg << std::endl << std::endl;
 
-        // best results for RTX 3060
-        const int BM = 128;
-        const int BN = 128;
-        const int BK = 16;
-        const int WM = 64;
-        const int WN = 32;
-        const int TM = 16;
-        const int TN = 4;
-
-        dim3 block_size(BN/TN, BM/TM, 1);
-        dim3 grid_size(CEIL_DIV(N, block_size.x * TN), CEIL_DIV(M, block_size.y * TM), 1);
-        run_custom_sgemm<sgemm_warp_tiling<BM, BN, BK, WM, WN, TM, TN>>(
-            handle, dA, dB, dC, M, N, K, iters, block_size, grid_size, "warp tiling", verify);
+        run_autotuned_with_static_for(cfg, handle, dA, dB, dC, M, N, K, iters, "warp tiling with autotune", verify);
     }
 
     {   
