@@ -1054,9 +1054,11 @@ Config autotune_sgemm(cublasHandle_t handle,
 
     // macro to instantiate + benchmark one config
     #define TRY(BM, BN, BK, TM, TN) do {                           \
+        std::cout << BM << " " << BN << " " << BK << " | " << TM << " " << TN << " - > "; \
         double g = bench_config<BM, BN, BK, TM, TN>(               \
             handle, dA, dB, dC, M, N, K, iters, verify);           \
         update(BM, BN, BK, TM, TN, g);                             \
+        std::cout << g << " TFlop/s" << std::endl; \
     } while (0)
 
     // square-ish tiles, low BK
@@ -1255,9 +1257,18 @@ ConfigWarpTiling autotune_sgemm_wt(cublasHandle_t handle,
     // BK=32 (Maxing out the K dimension for small blocks)
     TRY( 64,  64, 32,  16, 32,  4,  4);
 
+    // MY variants
     // rect size blocks
-    TRY(128, 128,  16,  32, 64,  4,  16); // 4x2 Warps
-    TRY(128, 128,  16,  64, 32,  16,  4); // 2x4 Warps
+    TRY(128, 128,  16,  32, 64,  4,  16);
+    TRY(128, 128,  16,  64, 32,  16,  4);
+
+    // rect size blocks
+    TRY(128, 128,  8,  32, 64,  4,  16);
+    TRY(128, 128,  8,  64, 32,  16,  4);
+
+    // rect size blocks
+    TRY(128, 128,  32,  32, 64,  4,  16);
+    TRY(128, 128,  32,  64, 32,  16,  4);
 
     #undef TRY
 
