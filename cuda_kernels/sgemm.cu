@@ -1013,6 +1013,35 @@ void static_for(ValueList<Is...>, Func&& f) {
     (f.template operator()<Is>(), ...);
 }
 
+//#define LARGE_AUTOTUNE_SEARCH_SPACE
+
+#ifdef LARGE_AUTOTUNE_SEARCH_SPACE
+// Block sizes to try
+using BMs  = ValueList<64, 128>;
+using BNs  = ValueList<64, 128>;
+using BKs  = ValueList<8, 16>;
+
+// Warp sizes to try
+using WMs  = ValueList<16, 32, 64>;
+using WNs  = ValueList<16, 32, 64>;
+
+// Thread sizes to try
+using TMs  = ValueList<1, 2, 4, 8, 16, 32>;
+using TNs  = ValueList<1, 2, 4, 8, 16, 32>;
+#else
+using BMs  = ValueList<64, 128>;
+using BNs  = ValueList<64, 128>;
+using BKs  = ValueList<8>;
+
+// Warp sizes to try
+using WMs  = ValueList<32, 64>;
+using WNs  = ValueList<32, 64>;
+
+// Thread sizes to try
+using TMs  = ValueList<4, 8>;
+using TNs  = ValueList<4, 8>;
+#endif
+
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct Config {
@@ -1078,15 +1107,6 @@ Config autotune_sgemm(cublasHandle_t handle,
         }
     };
 
-    // Block sizes to try
-    using BMs  = ValueList<64, 128>;
-    using BNs  = ValueList<64, 128>;
-    using BKs  = ValueList<8, 16, 32>;
-
-    // Thread sizes to try
-    using TMs  = ValueList<4, 8>;
-    using TNs  = ValueList<4, 8>;
-
     static_for(BMs{}, [&]<int BM>() {
         static_for(BNs{}, [&]<int BN>() {
             static_for(BKs{}, [&]<int BK>() {
@@ -1109,39 +1129,46 @@ Config autotune_sgemm(cublasHandle_t handle,
     return best;
 }
 
+template<typename Cfg>
+void run_autotuned(const Cfg& cfg,
+                   cublasHandle_t handle,
+                   const float* dA, const float* dB, float* dC,
+                   int M, int N, int K,
+                   int iters, std::string name, bool verify)
+{
+    bool launched = false;
+
+    static_for(BMs{}, [&]<int BM>() {
+        static_for(BNs{}, [&]<int BN>() {
+            static_for(BKs{}, [&]<int BK>() {
+                static_for(TMs{}, [&]<int TM>() {
+                    static_for(TNs{}, [&]<int TN>() {
+                        constexpr bool threads_fit = ((BM * BN) / (TM * TN)) <= 256;
+
+                        if constexpr (threads_fit) {
+                            if (cfg.BM == BM && cfg.BN == BN && cfg.BK == BK && cfg.TM == TM && cfg.TN == TN) {
+                                dim3 block_size(BN/TN, BM/TM, 1);
+                                dim3 grid_size(CEIL_DIV(N, block_size.x * TN), CEIL_DIV(M, block_size.y * TM), 1);
+                                run_custom_sgemm<sgemm_vectorize_smem<BM, BN, BK, TM, TN>>(
+                                    handle, dA, dB, dC, M, N, K, iters, block_size, grid_size, name, verify);
+
+                                launched = true;
+                            }
+                        }
+                    });
+                });
+            });
+        });
+    });
+
+    if (!launched) {
+        throw std::runtime_error("Autotuned cfg is not in the compiled search space");
+    }
+}
+
 /////////////////////////////////////////////////////////////////////////////////////////////////
 // ditto for warp tiling
 // have to boilerplate because of additonal WM/WN params
-
-
-#define LARGE_AUTOTUNE_SEARCH_SPACE
-
-#ifdef LARGE_AUTOTUNE_SEARCH_SPACE
-// Block sizes to try
-using BMs  = ValueList<64, 128>;
-using BNs  = ValueList<64, 128>;
-using BKs  = ValueList<8, 16>;
-
-// Warp sizes to try
-using WMs  = ValueList<16, 32, 64>;
-using WNs  = ValueList<16, 32, 64>;
-
-// Thread sizes to try
-using TMs  = ValueList<1, 2, 4, 8, 16, 32>;
-using TNs  = ValueList<1, 2, 4, 8, 16, 32>;
-#else
-using BMs  = ValueList<64, 128>;
-using BNs  = ValueList<64, 128>;
-using BKs  = ValueList<8>;
-
-// Warp sizes to try
-using WMs  = ValueList<32, 64>;
-using WNs  = ValueList<32, 64>;
-
-// Thread sizes to try
-using TMs  = ValueList<4, 8>;
-using TNs  = ValueList<4, 8>;
-#endif
 
 struct ConfigWarpTiling {
     int BM, BN, BK, WM, WN, TM, TN;
@@ -1170,10 +1197,10 @@ double bench_config_wt(cublasHandle_t handle,
     try {
         static_assert(BN % TN == 0, "BN % TN != 0");
         static_assert(BM % TM == 0, "BM % TM != 0");
-        /*static_assert(BN % WN == 0, "BN % WN != 0");
+        static_assert(BN % WN == 0, "BN % WN != 0");
         static_assert(BM % WM == 0, "BM % WM != 0");
         static_assert(WN % TM == 0, "WN % TM != 0");
-        static_assert(WM % TM == 0, "WM % TM != 0");*/
+        static_assert(WM % TM == 0, "WM % TM != 0");
 
         dim3 block_size(BN / TN, BM / TM, 1);
         int threads = block_size.x * block_size.y;
@@ -1248,11 +1275,11 @@ ConfigWarpTiling autotune_sgemm_wt(cublasHandle_t handle,
 }
 
 template<typename Cfg>
-void run_autotuned_with_static_for(const Cfg& cfg,
-                                   cublasHandle_t handle,
-                                   const float* dA, const float* dB, float* dC,
-                                   int M, int N, int K,
-                                   int iters, std::string name, bool verify)
+void run_autotuned_wt(const Cfg& cfg,
+                      cublasHandle_t handle,
+                      const float* dA, const float* dB, float* dC,
+                      int M, int N, int K,
+                      int iters, std::string name, bool verify)
 {
     bool launched = false;
 
@@ -1417,22 +1444,12 @@ int main(int argc, char** argv)
 
     // do autotuning
     {   
-        /*std::cout << "Autotuning in process..." << std::endl;
+        std::cout << "Autotuning in process..." << std::endl;
         auto cfg = autotune_sgemm(handle, dA, dB, dC, M, N, K, iters, verify);
         std::cout << "done!" << std::endl;
-        std::cout << "best config: " << cfg << std::endl << std::endl;*/
+        std::cout << "best config: " << cfg << std::endl << std::endl;
 
-        // Autotuned results for RTX 3060
-        const int BM = 64;
-        const int BN = 64;
-        const int BK = 16;
-        const int MICRO_M = 8;
-        const int MICRO_N = 4;
-
-        dim3 block_size(BN/MICRO_N, BM/MICRO_M, 1);
-        dim3 grid_size(CEIL_DIV(N, block_size.x * MICRO_N), CEIL_DIV(M, block_size.y * MICRO_M), 1);
-        run_custom_sgemm<sgemm_vectorize_smem<BM, BN, BK, MICRO_M, MICRO_N>>(
-            handle, dA, dB, dC, M, N, K, iters, block_size, grid_size, "autotune", verify);
+        run_autotuned(cfg, handle, dA, dB, dC, M, N, K, iters, "autotuned", verify);
     }
 
     {   
@@ -1441,7 +1458,7 @@ int main(int argc, char** argv)
         std::cout << "done!" << std::endl;
         std::cout << "warp tiling best config: " << cfg << std::endl << std::endl;
 
-        run_autotuned_with_static_for(cfg, handle, dA, dB, dC, M, N, K, iters, "warp tiling with autotune", verify);
+        run_autotuned_wt(cfg, handle, dA, dB, dC, M, N, K, iters, "warp tiling with autotune", verify);
     }
 
     {   
