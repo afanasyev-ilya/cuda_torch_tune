@@ -27,62 +27,9 @@
 #include <random>
 #include <cstdlib>
 #include <cmath>
+#include "macros.cuh"
 
 #include <mma.h>
-
-// ----------------- Helpers & macros -----------------
-
-#define CHECK_CUDA(call)                                               \
-  do                                                                   \
-  {                                                                    \
-    cudaError_t status_ = (call);                                      \
-    if (status_ != cudaSuccess)                                        \
-    {                                                                  \
-      std::cerr << "CUDA error: " << cudaGetErrorString(status_)       \
-                << " at " << __FILE__ << ":" << __LINE__ << std::endl; \
-      std::exit(EXIT_FAILURE);                                         \
-    }                                                                  \
-  } while (0)
-
-#define CHECK_CUBLAS(call)                                             \
-  do                                                                   \
-  {                                                                    \
-    cublasStatus_t status_ = (call);                                   \
-    if (status_ != CUBLAS_STATUS_SUCCESS)                              \
-    {                                                                  \
-      std::cerr << "cuBLAS error: " << status_                         \
-                << " at " << __FILE__ << ":" << __LINE__ << std::endl; \
-      std::exit(EXIT_FAILURE);                                         \
-    }                                                                  \
-  } while (0)
-
-#define CHECK_CUTLASS(status)                                            \
-  do                                                                     \
-  {                                                                      \
-    if ((status) != cutlass::Status::kSuccess)                           \
-    {                                                                    \
-      std::cerr << "CUTLASS error: "                                     \
-                << cutlass::cutlassGetStatusString(status) << std::endl; \
-      std::exit(EXIT_FAILURE);                                           \
-    }                                                                    \
-  } while (0)
-
-#define CEIL_DIV(a, b) ( ((a) - 1) / (b) + 1 )
-
-// ----------------- Custom CUDA GEMM -----------------
-
-#define TILE_M 128
-#define TILE_K 16
-#define TILE_N 128
-
-#define BX 16
-#define BY 16
-
-#define MICRO_M (TILE_M/BX) // 
-#define MICRO_N (TILE_N/BY) // changing 8 -> 6 gave +1.5 tflop
-
-static_assert(BX == TILE_N / MICRO_N, "BX must me = TILE_N / MICRO_N");
-static_assert(BY == TILE_M / MICRO_M, "BY must me = TILE_M / MICRO_M");
 
 // ----------------- cuBLAS GEMM (row-major via trick) -----------------
 
