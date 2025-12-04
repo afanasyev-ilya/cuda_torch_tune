@@ -993,10 +993,11 @@ __global__ void sgemm_double_buffering(const float * __restrict__ A,
     }
 }
 
-// ---------------------------------------
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// autotune things here
 
 struct Config {
-    int BM, BN, BK, MICRO_M, MICRO_N;
+    int BM, BN, BK, TM, TN;
     double flops;
 };
 
@@ -1005,8 +1006,8 @@ std::ostream& operator<<(std::ostream& os, const Config& c) {
        << "BM=" << c.BM
        << ", BN=" << c.BN
        << ", BK=" << c.BK
-       << ", MICRO_M=" << c.MICRO_M
-       << ", MICRO_N=" << c.MICRO_N
+       << ", TM=" << c.TM
+       << ", TN=" << c.TN
        << ", flops=" << c.flops
        << "}";
     return os;
@@ -1045,17 +1046,17 @@ Config autotune_sgemm(cublasHandle_t handle,
 {
     Config best {0,0,0,0,0,0.0};
 
-    auto update = [&](int BM, int BN, int BK, int MM, int NN, double flops) {
+    auto update = [&](int BM, int BN, int BK, int TM, int TN, double flops) {
         if (flops > best.flops) {
-            best = {BM, BN, BK, MM, NN, flops};
+            best = {BM, BN, BK, TM, TN, flops};
         }
     };
 
     // macro to instantiate + benchmark one config
-    #define TRY(BM, BN, BK, MM, NN) do {                           \
-        double g = bench_config<BM, BN, BK, MM, NN>(               \
+    #define TRY(BM, BN, BK, TM, TN) do {                           \
+        double g = bench_config<BM, BN, BK, TM, TN>(               \
             handle, dA, dB, dC, M, N, K, iters, verify);           \
-        update(BM, BN, BK, MM, NN, g);                             \
+        update(BM, BN, BK, TM, TN, g);                             \
     } while (0)
 
     // square-ish tiles, low BK
@@ -1081,6 +1082,84 @@ Config autotune_sgemm(cublasHandle_t handle,
     TRY( 64, 128,  8,  4,  8);
     TRY(128,  64, 16,  8,  4);
     TRY( 64, 128, 16,  4,  8);
+
+    #undef TRY
+
+    return best;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// ditto for warp tiling
+// have to boilerplate because of additonal WM/WN params
+
+struct ConfigWarpTiling {
+    int BM, BN, BK, WM, WN, TM, TN;
+    double flops;
+};
+
+std::ostream& operator<<(std::ostream& os, const ConfigWarpTiling& c) {
+    os << "Config{"
+       << "BM=" << c.BM
+       << ", BN=" << c.BN
+       << ", BK=" << c.BK
+       << ", WM=" << c.WM
+       << ", WN=" << c.WN
+       << ", TM=" << c.TM
+       << ", TN=" << c.TN
+       << ", flops=" << c.flops
+       << "}";
+    return os;
+}
+
+template<int BM, int BN, int BK, int WM, int WN, int TM, int TN>
+double bench_config_wt(cublasHandle_t handle,
+                       const float* dA, const float* dB, float* dC,
+                       int M, int N, int K, int iters, bool verify)
+{
+    static_assert(BN % TN == 0, "BN % MICRO_N != 0");
+    static_assert(BM % TM == 0, "BM % MICRO_M != 0");
+
+    dim3 block_size(BN / TN, BM / TM, 1);
+    int threads = block_size.x * block_size.y;
+    if (threads > 1024) 
+        return 0.0;  // invalid on many GPUs
+
+    dim3 grid_size(
+        CEIL_DIV(N, block_size.x * TN),
+        CEIL_DIV(M, block_size.y * TM),
+        1
+    );
+
+    bool verbose = false;
+    double flops = run_custom_sgemm<sgemm_warp_tiling<BM, BN, BK, WM, WN, TM, TN>>(
+        handle, dA, dB, dC, M, N, K, iters,
+        block_size, grid_size,
+        "autotune warp tilig", verify, verbose
+    );
+    return flops;
+}
+
+ConfigWarpTiling autotune_sgemm_wt(cublasHandle_t handle,
+                         const float* dA, const float* dB, float* dC,
+                         int M, int N, int K, int iters, bool verify)
+{
+    ConfigWarpTiling best {0,0,0,0,0,0,0,0.0};
+
+    auto update = [&](int BM, int BN, int BK, int WM, int WN, int TM, int TN, double flops) {
+        if (flops > best.flops) {
+            best = {BM, BN, BK, WM, WN, TM, TN, flops};
+        }
+    };
+
+    // macro to instantiate + benchmark one config
+    #define TRY(BM, BN, BK, WM, WN, TM, TN) do {                           \
+        double g = bench_config_wt<BM, BN, BK, WM, WN, TM, TN>(               \
+            handle, dA, dB, dC, M, N, K, iters, verify);                   \
+        update(BM, BN, BK, WM, WN, TM, TN, g);                             \
+    } while (0)
+
+    TRY(128, 128,  8,  32, 64,   8, 8);
+    TRY(128, 128,  8,  64, 32,   8, 8);
 
     #undef TRY
 
@@ -1234,7 +1313,12 @@ int main(int argc, char** argv)
     }
 
     {   
-        // results for RTX 3060
+        std::cout << "WARP TILING Autotuning in process..." << std::endl;
+        auto cfg = autotune_sgemm_wt(handle, dA, dB, dC, M, N, K, iters, verify);
+        std::cout << "done!" << std::endl;
+        std::cout << "wt best result: " << cfg << std::endl << std::endl;
+
+        // best results for RTX 3060
         const int BM = 128;
         const int BN = 128;
         const int BK = 16;
