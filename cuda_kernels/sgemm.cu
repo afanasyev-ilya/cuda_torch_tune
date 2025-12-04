@@ -660,7 +660,7 @@ __global__ void sgemm_vectorize_smem(const float * __restrict__ A,
 
 // ---------------------------------------
 
-template<int TILE_M, int TILE_N, int TILE_K, int MICRO_M, int MICRO_N>
+template<int BM, int BN, int BK, int TM, int TN>
 __global__ void 
 __launch_bounds__(256)
 sgemm_warp_tiling(const float * __restrict__ A,
@@ -673,8 +673,8 @@ sgemm_warp_tiling(const float * __restrict__ A,
     const int thread_col = threadIdx.x;
     
     // Starting coords of output tile for matrix C
-    const int block_row = blockIdx.y * TILE_M;
-    const int block_col = blockIdx.x * TILE_N;
+    const int block_row = blockIdx.y * BM;
+    const int block_col = blockIdx.x * BN;
 
     // leading dims for simplicity
     const int lda = K;
@@ -685,28 +685,43 @@ sgemm_warp_tiling(const float * __restrict__ A,
     const int tid = threadIdx.x + blockDim.x * threadIdx.y;
     const int block_size = blockDim.x * blockDim.y;
 
+    const int warp_id = tid / 32;
+    const int lane_id = tid % 32;
+
+    const int W_ITER_M = 2;
+    const int W_ITER_N = 2;
+
+    const int WM = BM / W_ITER_M;
+    const int WN = BN / W_ITER_N;
+
+    const int warp_row = warp_id / W_ITER_N;
+    const int warp_col = warp_id % W_ITER_N;
+    const int threadsPerWarpRow = WN / TN;
+    const int threadRowInWarp = lane_id / threadsPerWarpRow;
+    const int threadColInWarp = lane_id % threadsPerWarpRow;
+
     // change: we transposed As here
-    __shared__ float As[TILE_K][TILE_M];
-    __shared__ float Bs[TILE_K][TILE_N];
+    __shared__ float As[BK][BM];
+    __shared__ float Bs[BK][BN];
 
-    const int num_tiles = (K - 1) / TILE_K + 1;
+    const int num_tiles = (K - 1) / BK + 1;
 
-    float reg_sums[MICRO_M][MICRO_N] = {0};
-    float reg_a[MICRO_M] = {0};
-    float reg_b[MICRO_N] = {0};
+    float reg_sums[TM][TN] = {0};
+    float reg_a[TM] = {0};
+    float reg_b[TN] = {0};
     
     for (int tile_id = 0; tile_id < num_tiles; tile_id++) {
-        int tile_offset = tile_id * TILE_K;
+        int tile_offset = tile_id * BK;
         // copy A
         constexpr int VECTOR_LENGTH = 4;
         
         // we do less loop step now, because of copy is done using vectors
         #pragma unroll
-        for(int i = tid; i < (TILE_M*TILE_K) / VECTOR_LENGTH; i += block_size) {
+        for(int i = tid; i < (BM*BK) / VECTOR_LENGTH; i += block_size) {
             int linear_idx = i * VECTOR_LENGTH;
             // shared cols go with stride 4 (VECTOR_LENGTH) now
-            int shared_col = linear_idx % TILE_K; // changes in range of [0, TILE_K], with strides
-            int shared_row = linear_idx / TILE_K; // changes in range of [0, TILE_M]
+            int shared_col = linear_idx % BK; // changes in range of [0, BK], with strides
+            int shared_row = linear_idx / BK; // changes in range of [0, BM]
 
             int global_col = tile_offset + shared_col;
             int global_row = block_row + shared_row;
@@ -720,10 +735,10 @@ sgemm_warp_tiling(const float * __restrict__ A,
 
         // copy B
         #pragma unroll
-        for(int i = tid; i < (TILE_K*TILE_N) / VECTOR_LENGTH; i += block_size) {
+        for(int i = tid; i < (BK*BN) / VECTOR_LENGTH; i += block_size) {
             int linear_idx = i * VECTOR_LENGTH;
-            int shared_col = linear_idx % TILE_N; // changes in range of [0, TILE_N], with strides
-            int shared_row = linear_idx / TILE_N; // changes in range of [0, TILE_K]
+            int shared_col = linear_idx % BN; // changes in range of [0, TN], with strides
+            int shared_row = linear_idx / BN; // changes in range of [0, TK]
 
             int global_col = block_col + shared_col;
             int global_row = tile_offset + shared_row;
@@ -737,12 +752,14 @@ sgemm_warp_tiling(const float * __restrict__ A,
 
         __syncthreads();
 
-        const int my_row_in_shared = thread_row * MICRO_M;
-        const int my_col_in_shared = thread_col * MICRO_N;
-        
-        for(int dot_idx = 0; dot_idx < TILE_K; dot_idx++) {
+        const int my_row_in_shared = thread_row * TM;
+        const int my_col_in_shared = thread_col * TN;
+        //int my_row_in_shared = (warpRow * WM) + (threadRowInWarp * TM);
+        //int my_col_in_shared = (warpCol * WN) + (threadColInWarp * TN);
+
+        for(int dot_idx = 0; dot_idx < BK; dot_idx++) {
             #pragma unroll
-            for(int elt_idx = 0; elt_idx < MICRO_M; elt_idx++) {
+            for(int elt_idx = 0; elt_idx < TM; elt_idx++) {
                 // this is actually most complext thing here
                 // similar to 1d, dot_idx runs among cols A
                 // and for rows, we just copy MICRO_M elements (row elements per thread)
@@ -750,16 +767,16 @@ sgemm_warp_tiling(const float * __restrict__ A,
             }
             
             #pragma unroll
-            for(int elt_idx = 0; elt_idx < MICRO_N; elt_idx++) {
+            for(int elt_idx = 0; elt_idx < TN; elt_idx++) {
                 // vise versa but for B matrix
                 reg_b[elt_idx] = Bs[dot_idx][my_col_in_shared + elt_idx];
             }
 
             // actual matmul on registers here
             #pragma unroll
-            for(int a_idx = 0; a_idx < MICRO_M; a_idx++) {
+            for(int a_idx = 0; a_idx < TM; a_idx++) {
                 #pragma unroll
-                for(int b_idx = 0; b_idx < MICRO_N; b_idx++) {
+                for(int b_idx = 0; b_idx < TN; b_idx++) {
                     reg_sums[a_idx][b_idx] += reg_a[a_idx] * reg_b[b_idx];
                 }
             }
@@ -769,11 +786,11 @@ sgemm_warp_tiling(const float * __restrict__ A,
     }
 
     #pragma unroll
-    for(int a_idx = 0; a_idx < MICRO_M; a_idx++) {
+    for(int a_idx = 0; a_idx < TM; a_idx++) {
         #pragma unroll
-        for(int b_idx = 0; b_idx < MICRO_N; b_idx++) {
-            int row = block_row + thread_row * MICRO_M + a_idx;
-            int col = block_col + thread_col * MICRO_N + b_idx;
+        for(int b_idx = 0; b_idx < TN; b_idx++) {
+            int row = block_row + thread_row * TM + a_idx;
+            int col = block_col + thread_col * TN + b_idx;
             if (row < M && col < N) {
                 C[row * ldc + col] = alpha * reg_sums[a_idx][b_idx] + beta * C[row * ldc + col];
             }
@@ -1206,10 +1223,10 @@ int main(int argc, char** argv)
 
     // do autotuning
     {   
-        std::cout << "Autotuning in process..." << std::endl;
+        /*std::cout << "Autotuning in process..." << std::endl;
         auto cfg = autotune_sgemm(handle, dA, dB, dC, M, N, K, iters, verify);
         std::cout << "done!" << std::endl;
-        std::cout << "best result: " << cfg << std::endl << std::endl;
+        std::cout << "best result: " << cfg << std::endl << std::endl;*/
 
         // Autotuned results for RTX 3060
         const int BM = 64;
