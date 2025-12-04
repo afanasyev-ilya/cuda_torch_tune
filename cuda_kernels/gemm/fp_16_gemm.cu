@@ -775,11 +775,17 @@ int main(int argc, char** argv)
         const int BM = 128;
         const int BN = 128;
         const int BK = 16;
+
         const int WM = 64;
         const int WN = 64;
 
+        const int WARPS_PER_BLOCK_M = BM / WM;
+        const int WARPS_PER_BLOCK_N = BN / WN;
+        const int WARPS_PER_BLOCK = WARPS_PER_BLOCK_M * WARPS_PER_BLOCK_N;
+
         CHECK_CUDA(cudaMemset(dC, 0, bytesC));
-        dim3 opt_block(32, 4);
+        std::cout << "BLOCK SIZE: " << WARP_SIZE * WARPS_PER_BLOCK << std::endl;
+        dim3 opt_block(WARP_SIZE, WARPS_PER_BLOCK);
         dim3 opt_grid(CEIL_DIV(N, BN), CEIL_DIV(M, BM), 1);
         run_wmma_bf16_gemm<gemm_warp_tensorcore<BM, BN, BK, WM, WN>>(M, N, K, dA, dB, dC, iters, opt_block, opt_grid, handle, "WMMA OPT");
     }
