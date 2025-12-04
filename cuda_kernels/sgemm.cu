@@ -1116,28 +1116,34 @@ double bench_config_wt(cublasHandle_t handle,
                        const float* dA, const float* dB, float* dC,
                        int M, int N, int K, int iters, bool verify)
 {
-    static_assert(BN % TN == 0, "BN % MICRO_N != 0");
-    static_assert(BM % TM == 0, "BM % MICRO_M != 0");
+    try {
+        static_assert(BN % TN == 0, "BN % MICRO_N != 0");
+        static_assert(BM % TM == 0, "BM % MICRO_M != 0");
 
-    dim3 block_size(BN / TN, BM / TM, 1);
-    int threads = block_size.x * block_size.y;
-    if (threads > 1024) 
-        return 0.0;  // invalid on many GPUs
+        dim3 block_size(BN / TN, BM / TM, 1);
+        int threads = block_size.x * block_size.y;
+        if (threads > 1024) 
+            return 0.0;  // invalid on many GPUs
 
-    dim3 grid_size(
-        CEIL_DIV(N, block_size.x * TN),
-        CEIL_DIV(M, block_size.y * TM),
-        1
-    );
+        dim3 grid_size(
+            CEIL_DIV(N, block_size.x * TN),
+            CEIL_DIV(M, block_size.y * TM),
+            1
+        );
 
-    bool verbose = false;
-    double flops = run_custom_sgemm<sgemm_warp_tiling<BM, BN, BK, WM, WN, TM, TN>>(
-        handle, dA, dB, dC, M, N, K, iters,
-        block_size, grid_size,
-        "autotune warp tilig", verify, verbose
-    );
-    return flops;
+        bool verbose = false;
+        double flops = run_custom_sgemm<sgemm_warp_tiling<BM, BN, BK, WM, WN, TM, TN>>(
+            handle, dA, dB, dC, M, N, K, iters,
+            block_size, grid_size,
+            "autotune warp tilig", verify, verbose
+        );
+        return flops;
+    } catch(...) {
+        return 0.0;
+    }
 }
+
+#include <iomanip>
 
 ConfigWarpTiling autotune_sgemm_wt(cublasHandle_t handle,
                          const float* dA, const float* dB, float* dC,
@@ -1151,15 +1157,107 @@ ConfigWarpTiling autotune_sgemm_wt(cublasHandle_t handle,
         }
     };
 
+    std::cout << std::setprecision(3);
     // macro to instantiate + benchmark one config
     #define TRY(BM, BN, BK, WM, WN, TM, TN) do {                           \
+        std::cout << BM << " " << BN << " " << BK << " | " << WM << " " << WN << " | " << TM << " " << TN << " - > "; \
         double g = bench_config_wt<BM, BN, BK, WM, WN, TM, TN>(               \
             handle, dA, dB, dC, M, N, K, iters, verify);                   \
         update(BM, BN, BK, WM, WN, TM, TN, g);                             \
-    } while (0)
+        std::cout << g << " TFlop/s" << std::endl; \
+    } while (0) \
 
-    TRY(128, 128,  8,  32, 64,   8, 8);
-    TRY(128, 128,  8,  64, 32,   8, 8);
+    // =========================================================================
+    // 1. THE HEAVYWEIGHTS: 128x128 BLOCKS
+    // =========================================================================
+    // Constraint: Must use 8x8 Thread Tiling.
+    // Why? 128x128 / (8x8) = 256 Threads (Max allowed).
+    // Smaller thread tiles (e.g. 4x8) would require 512 threads, breaking launch bounds.
+
+    // --- BK = 8 (Standard) ---
+    TRY(128, 128,  8,  32, 64,  8,  8); // 4x2 Warps
+    TRY(128, 128,  8,  64, 32,  8,  8); // 2x4 Warps
+
+    // --- BK = 16 (High Bandwidth / Double Buffering) ---
+    TRY(128, 128, 16,  32, 64,  8,  8);
+    TRY(128, 128, 16,  64, 32,  8,  8);
+
+    // =========================================================================
+    // 2. RECTANGULAR BLOCKS: 128x64
+    // =========================================================================
+    // These allow for higher occupancy strategies or different thread tile shapes.
+
+    // --- High Occupancy: 256 Threads (Using 4x8 or 8x4 Thread Tiles) ---
+    
+    // TM=8, TN=4 (32 regs accumulation)
+    // Warp Constraint: WM*WN = 1024
+    TRY(128,  64,  8,  32, 32,  8,  4); // Square Warp 32x32
+    TRY(128,  64,  8,  64, 16,  8,  4); // Tall Warp
+    TRY(128,  64,  8,  16, 64,  8,  4); // Wide Warp
+
+    // TM=4, TN=8 (32 regs accumulation)
+    TRY(128,  64,  8,  32, 32,  4,  8); 
+    TRY(128,  64,  8,  64, 16,  4,  8);
+    TRY(128,  64,  8,  16, 64,  4,  8);
+
+    // --- Standard Occupancy: 128 Threads (Using 8x8 Thread Tiles) ---
+    // Good if 256 threads cause register spilling
+    TRY(128,  64,  8,  32, 64,  8,  8);
+    TRY(128,  64,  8,  64, 32,  8,  8);
+
+    // =========================================================================
+    // 3. RECTANGULAR BLOCKS: 64x128 (Symmetric)
+    // =========================================================================
+    
+    // --- High Occupancy: 256 Threads ---
+    // TM=8, TN=4
+    TRY( 64, 128,  8,  32, 32,  8,  4);
+    TRY( 64, 128,  8,  64, 16,  8,  4);
+    TRY( 64, 128,  8,  16, 64,  8,  4);
+
+    // TM=4, TN=8
+    TRY( 64, 128,  8,  32, 32,  4,  8);
+    TRY( 64, 128,  8,  64, 16,  4,  8);
+    TRY( 64, 128,  8,  16, 64,  4,  8);
+
+    // =========================================================================
+    // 4. COMPACT BLOCKS: 64x64
+    // =========================================================================
+    // Excellent for smaller matrices (M, N < 1024) or older GPUs.
+    
+    // --- Max Occupancy: 256 Threads (Must use 4x4 Thread Tiles) ---
+    // TM=4, TN=4 (16 regs accumulation)
+    // Warp Constraint: WM*WN = 512
+    TRY( 64,  64,  8,  16, 32,  4,  4);
+    TRY( 64,  64,  8,  32, 16,  4,  4);
+    TRY( 64,  64,  8,  64,  8,  4,  4); // Very wide warp tile
+    TRY( 64,  64,  8,   8, 64,  4,  4); // Very tall warp tile
+    
+    // Also try aggressive BK=16 for these small tiles
+    TRY( 64,  64, 16,  16, 32,  4,  4);
+    TRY( 64,  64, 16,  32, 16,  4,  4);
+
+    // --- Medium Occupancy: 128 Threads (8x4 or 4x8 Thread Tiles) ---
+    TRY( 64,  64,  8,  32, 32,  8,  4);
+    TRY( 64,  64,  8,  32, 32,  4,  8);
+    // Asymmetric Warp shapes for 128 threads
+    TRY( 64,  64,  8,  16, 64,  4,  8);
+    TRY( 64,  64,  8,  64, 16,  8,  4);
+
+    // =========================================================================
+    // 5. EXPERIMENTAL / EDGE CASES
+    // =========================================================================
+    // Very small blocks (32x32) with high BK. 
+    // Usually not optimal for SGEMM but good for specific cache sizes.
+    // 32x32 Block / 4x4 Thread = 64 Threads.
+    TRY( 32,  32,  8,  16, 16,  4,  4); 
+    TRY( 32,  32, 16,  16, 16,  4,  4); 
+    // BK=32 (Maxing out the K dimension for small blocks)
+    TRY( 64,  64, 32,  16, 32,  4,  4);
+
+    // rect size blocks
+    TRY(128, 128,  16,  32, 64,  4,  16); // 4x2 Warps
+    TRY(128, 128,  16,  64, 32,  16,  4); // 2x4 Warps
 
     #undef TRY
 
@@ -1294,10 +1392,10 @@ int main(int argc, char** argv)
 
     // do autotuning
     {   
-        std::cout << "Autotuning in process..." << std::endl;
+        /*std::cout << "Autotuning in process..." << std::endl;
         auto cfg = autotune_sgemm(handle, dA, dB, dC, M, N, K, iters, verify);
         std::cout << "done!" << std::endl;
-        std::cout << "best result: " << cfg << std::endl << std::endl;
+        std::cout << "best result: " << cfg << std::endl << std::endl;*/
 
         // Autotuned results for RTX 3060
         const int BM = 64;
