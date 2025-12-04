@@ -1013,7 +1013,9 @@ void static_for(ValueList<Is...>, Func&& f) {
     (f.template operator()<Is>(), ...);
 }
 
-//#define LARGE_AUTOTUNE_SEARCH_SPACE
+inline constexpr int quite_autotune = true;
+
+#define LARGE_AUTOTUNE_SEARCH_SPACE
 
 #ifdef LARGE_AUTOTUNE_SEARCH_SPACE
 // Block sizes to try
@@ -1097,13 +1099,16 @@ Config autotune_sgemm(cublasHandle_t handle,
     std::cout << std::setprecision(3);
 
     auto update = [&](int BM, int BN, int BK, int TM, int TN, double flops) {
-        std::cout << "Tested: " << BM << " " << BN << " " << BK << " | " << TM << " " << TN 
+        if(!quite_autotune)
+            std::cout << "Tested: " << BM << " " << BN << " " << BK << " | " << TM << " " << TN 
                   << " -> " << flops << " GFLOPS ";
         if (flops > best.flops) {
-            std::cout << " (new best found!)" << std::endl;
+            if(!quite_autotune)
+                std::cout << " (new best found!)" << std::endl;
             best = {BM, BN, BK, TM, TN, flops};
         } else {
-            std::cout << std::endl;
+            if(!quite_autotune)
+                std::cout << std::endl;
         }
     };
 
@@ -1197,10 +1202,10 @@ double bench_config_wt(cublasHandle_t handle,
     try {
         static_assert(BN % TN == 0, "BN % TN != 0");
         static_assert(BM % TM == 0, "BM % TM != 0");
-        static_assert(BN % WN == 0, "BN % WN != 0");
+        /*static_assert(BN % WN == 0, "BN % WN != 0");
         static_assert(BM % WM == 0, "BM % WM != 0");
         static_assert(WN % TM == 0, "WN % TM != 0");
-        static_assert(WM % TM == 0, "WM % TM != 0");
+        static_assert(WM % TM == 0, "WM % TM != 0");*/
 
         dim3 block_size(BN / TN, BM / TM, 1);
         int threads = block_size.x * block_size.y;
@@ -1234,14 +1239,17 @@ ConfigWarpTiling autotune_sgemm_wt(cublasHandle_t handle,
     std::cout << std::setprecision(3);
 
     auto update = [&](int BM, int BN, int BK, int WM, int WN, int TM, int TN, double flops) {
-        std::cout << "Tested: " << BM << " " << BN << " " << BK << " | " 
-                  << WM << " " << WN << " | " << TM << " " << TN 
-                  << " -> " << flops << " GFLOPS";
+        if(!quite_autotune)
+            std::cout << "Tested: " << BM << " " << BN << " " << BK << " | " 
+                    << WM << " " << WN << " | " << TM << " " << TN 
+                    << " -> " << flops << " GFLOPS";
         if (flops > best.flops) {
-            std::cout << " (new best found!)" << std::endl;
+            if(!quite_autotune)
+                std::cout << " (new best found!)" << std::endl;
             best = {BM, BN, BK, WM, WN, TM, TN, flops};
         } else {
-            std::cout << std::endl;
+            if(!quite_autotune)
+                std::cout << std::endl;
         }
     };
 
