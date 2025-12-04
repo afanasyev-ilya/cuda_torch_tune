@@ -661,7 +661,9 @@ __global__ void sgemm_vectorize_smem(const float * __restrict__ A,
 // ---------------------------------------
 
 template<int TILE_M, int TILE_N, int TILE_K, int MICRO_M, int MICRO_N>
-__global__ void sgemm_warp_tiling(const float * __restrict__ A,
+__global__ void 
+__launch_bounds__(256)
+sgemm_warp_tiling(const float * __restrict__ A,
                                   const float * __restrict__ B,
                                   float * __restrict__  C,
                                   int M, int N, int K,
@@ -684,8 +686,8 @@ __global__ void sgemm_warp_tiling(const float * __restrict__ A,
     const int block_size = blockDim.x * blockDim.y;
 
     // change: we transposed As here
-    __shared__ float As[TILE_K * TILE_M];
-    __shared__ float Bs[TILE_K * TILE_N];
+    __shared__ float As[TILE_K][TILE_M];
+    __shared__ float Bs[TILE_K][TILE_N];
 
     const int num_tiles = (K - 1) / TILE_K + 1;
 
@@ -710,10 +712,10 @@ __global__ void sgemm_warp_tiling(const float * __restrict__ A,
             int global_row = block_row + shared_row;
             
             float4 tmp = reinterpret_cast<const float4 *>(&A[global_row * lda + global_col])[0];
-            As[(shared_col + 0) * TILE_M + shared_row] = tmp.x;
-            As[(shared_col + 1) * TILE_M + shared_row] = tmp.y;
-            As[(shared_col + 2) * TILE_M + shared_row] = tmp.z;
-            As[(shared_col + 3) * TILE_M + shared_row] = tmp.w;
+            As[(shared_col + 0)][shared_row] = tmp.x;
+            As[(shared_col + 1)][shared_row] = tmp.y;
+            As[(shared_col + 2)][shared_row] = tmp.z;
+            As[(shared_col + 3)][shared_row] = tmp.w;
         }
 
         // copy B
@@ -727,27 +729,30 @@ __global__ void sgemm_warp_tiling(const float * __restrict__ A,
             int global_row = tile_offset + shared_row;
 
             float4 tmp = reinterpret_cast<const float4 *>(&B[global_row * ldb + global_col])[0];
-            Bs[(shared_row) * TILE_N + shared_col + 0] = tmp.x;
-            Bs[(shared_row) * TILE_N + shared_col + 1] = tmp.y;
-            Bs[(shared_row) * TILE_N + shared_col + 2] = tmp.z;
-            Bs[(shared_row) * TILE_N + shared_col + 3] = tmp.w;
+            Bs[(shared_row)][shared_col + 0] = tmp.x;
+            Bs[(shared_row)][shared_col + 1] = tmp.y;
+            Bs[(shared_row)][shared_col + 2] = tmp.z;
+            Bs[(shared_row)][shared_col + 3] = tmp.w;
         }
 
         __syncthreads();
 
+        const int my_row_in_shared = thread_row * MICRO_M;
+        const int my_col_in_shared = thread_col * MICRO_N;
+        
         for(int dot_idx = 0; dot_idx < TILE_K; dot_idx++) {
             #pragma unroll
             for(int elt_idx = 0; elt_idx < MICRO_M; elt_idx++) {
                 // this is actually most complext thing here
                 // similar to 1d, dot_idx runs among cols A
                 // and for rows, we just copy MICRO_M elements (row elements per thread)
-                reg_a[elt_idx] = As[dot_idx * TILE_M + thread_row * MICRO_M + elt_idx];
+                reg_a[elt_idx] = As[dot_idx][my_row_in_shared + elt_idx];
             }
             
             #pragma unroll
             for(int elt_idx = 0; elt_idx < MICRO_N; elt_idx++) {
                 // vise versa but for B matrix
-                reg_b[elt_idx] = Bs[dot_idx * TILE_N + thread_col * MICRO_N + elt_idx];
+                reg_b[elt_idx] = Bs[dot_idx][my_col_in_shared + elt_idx];
             }
 
             // actual matmul on registers here
