@@ -381,3 +381,23 @@ int main(int argc, char** argv)
     CUDA_CHECK(cudaDeviceReset());
     return 0;
 }
+
+/*
+
+Dot product benchmark
+N = 67108864 elements, iterations = 10
+Using device 0: NVIDIA RTX A5000
+  canMapHostMemory = 1
+Kernel config: blocks = 65535, threads = 256, shmem = 32 bytes
+
+Reference dot = 18278664.000000 (expected 134217728.000000)
+
+==== Results (avg over 10 iters) ====
+1) Pageable   (malloc + cudaMemcpy):
+   time = 41.227 ms, result = 18278648.000000
+2) Pinned     (cudaMallocHost + cudaMemcpy):
+   time = 23.760 ms, result = 18278660.000000
+3) Mapped     (cudaHostAllocMapped, zero-copy):
+   time = 20.407 ms, result = 18278656.000000
+
+*/
